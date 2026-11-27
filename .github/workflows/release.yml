@@ -60,12 +60,13 @@ jobs:
             $packageFiles = @(
               'manifest.json', 'background.js', 'page.js', 'offscreen.html', 'offscreen.js',
               'popup.html', 'popup.css', 'popup.js', 'icons',
+              'faker-core.js', 'faker-content.js', 'faker-background.js', 'panel.js', 'NOTICE',
               'register-desktop-host.ps1', 'register-desktop-host.cmd', 'README.md', 'CHANGELOG.md'
             )
             Copy-Item -LiteralPath $packageFiles -Destination $bundle -Recurse
             Copy-Item -LiteralPath 'desktop-host/ScienceDirectDesktopHost.cs', 'desktop-host/ScienceDirectDesktopHost.exe' -Destination $desktopHost
             $archive = Join-Path $env:RUNNER_TEMP $assetName
-            Compress-Archive -LiteralPath $bundle -DestinationPath $archive -Force
+            Compress-Archive -Path (Join-Path $bundle '*') -DestinationPath $archive -Force
           }
 
           $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
