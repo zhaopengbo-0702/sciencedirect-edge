@@ -3,6 +3,15 @@ const ui = Object.fromEntries([
   'candidates', 'actions', 'focus', 'retry', 'show',
 ].map((id) => [id, document.getElementById(id)]));
 
+// Show the current version in the popup header. Read dynamically from the
+// manifest so every future release shows its own version automatically.
+try {
+  const versionLabel = document.getElementById('extension-version');
+  if (versionLabel) versionLabel.textContent = `v${chrome.runtime.getManifest().version}`;
+} catch {
+  // Version display is cosmetic.
+}
+
 let state = {status: 'idle'};
 let pending = false;
 let statusRequest = 0;

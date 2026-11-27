@@ -43,6 +43,7 @@
         .card { background: #202f3e !important; }
         .status-card, .settings { background: #202f3e !important; }
         .kicker, .settings-title, .hint, .card span { color: #b2c4d5 !important; }
+        .version { color: #b2c4d5 !important; }
       }
       .head { display: flex; align-items: center; gap: 9px; padding: 10px 11px; border-bottom: 1px solid #cbd5e0; }
       .logo { width: 32px; height: 32px; flex: 0 0 32px; border-radius: 7px; background: #174a78; position: relative; }
@@ -51,6 +52,7 @@
       .head-text { flex: 1; display: grid; gap: 1px; overflow: hidden; }
       .kicker { color: #4f6276; font-size: 11px; line-height: 1.2; }
       .title { font-weight: 650; font-size: 15px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .version { color: #4f6276; font-size: 11px; font-weight: 600; line-height: 1.2; }
       .dot { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: #174a78; margin-top: 4px; }
       .dot[data-status="complete"] { background: #16714b; }
       .dot[data-status="attention"] { background: #965713; }
@@ -100,6 +102,7 @@
         <div class="head-text">
           <span class="kicker">ScienceDirect</span>
           <span class="title">论文下载助手</span>
+          <span class="version" id="version"></span>
         </div>
         <button class="close" id="close" title="关闭面板（可点右上角 SD 圆钮重新打开）">×</button>
       </div>
@@ -147,6 +150,7 @@
     close: shadow.getElementById('close'),
     fakerEnabled: shadow.getElementById('faker-enabled'),
     fakerClick: shadow.getElementById('faker-click'),
+    version: shadow.getElementById('version'),
   };
 
   const settings = {enabled: true, autoClick: true};
@@ -322,6 +326,12 @@
     });
   } catch {
     // Ignore.
+  }
+
+  try {
+    if (el.version) el.version.textContent = `v${chrome.runtime.getManifest().version}`;
+  } catch {
+    // Version display is cosmetic.
   }
 
   void loadHidden();
