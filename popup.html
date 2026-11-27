@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ScienceDirect 论文下载助手</title>
+    <link rel="stylesheet" href="popup.css">
+    <script src="popup.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <img src="icons/48.png" alt="" width="40" height="40">
+        <div>
+          <p>ScienceDirect</p>
+          <h1>论文下载助手</h1>
+        </div>
+      </header>
+
+      <form id="paper-form">
+        <label for="paper">论文题名、DOI 或链接</label>
+        <input id="paper" type="text" placeholder="粘贴题名、DOI 或 ScienceDirect 链接"
+          autocomplete="off" spellcheck="false" required maxlength="2000">
+        <button type="submit" id="submit" class="primary">查找并下载 PDF</button>
+      </form>
+      <button type="button" id="current" class="current">下载当前页 PDF</button>
+
+      <section id="status-panel" class="status" aria-label="下载进度" hidden>
+        <div class="status-line">
+          <span id="status-marker" aria-hidden="true"></span>
+          <p id="status" role="status" aria-live="polite"></p>
+        </div>
+        <div id="candidates" hidden></div>
+        <div id="actions" class="actions" hidden>
+          <button type="button" id="focus" hidden>打开论文标签页</button>
+          <button type="button" id="retry" hidden>继续下载</button>
+          <button type="button" id="show" hidden>在桌面上显示</button>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
