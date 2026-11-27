@@ -18,7 +18,7 @@ const autoRecoverDelays = [15000, 30000, 60000, 120000];
 // Verification failures retry for much longer: Cloudflare challenges can take
 // a while to clear, and the user explicitly wants no manual intervention.
 // The first retries are extremely fast so a challenged tab recovers quickly.
-const autoVerificationDelays = [3000, 6000, 12000, 25000, 60000, 120000, 300000, 300000];
+const autoVerificationDelays = [6000, 15000, 30000, 60000, 120000, 300000, 300000, 300000];
 const autoDownloadRetries = 3;
 const autoDownloadRetryDelay = 6000;
 const stateKey = 'downloadJob';
@@ -40,6 +40,56 @@ const recoverablePdfReasons = new Set(['expired', 'fetch_failed', 'invalid_pdf',
 const popupStateKeys = ['status', 'message', 'candidates', 'tabId', 'readerTabId', 'downloadId', 'title', 'filename', 'canRetry', 'showError', 'awaitingBrowserDownload'];
 let flight;
 let wakeAfterFlight = false;
+
+// v2.6: remember which papers were already saved so a duplicate recovery run
+// can never drop the same PDF on the Desktop twice.
+const savedDownloads = new Map();
+let savedDownloadsLoaded = false;
+const saveLocks = new Map();
+
+function downloadKey(job) {
+  return String(job?.pii || job?.doi || job?.targetUrl || job?.title || '').trim().toLowerCase();
+}
+
+async function loadSavedDownloads() {
+  if (savedDownloadsLoaded) return;
+  savedDownloadsLoaded = true;
+  try {
+    const stored = await chrome.storage.local.get('savedDownloads');
+    const entries = Array.isArray(stored?.savedDownloads) ? stored.savedDownloads : [];
+    for (const entry of entries) {
+      if (entry && typeof entry.key === 'string' && typeof entry.path === 'string') {
+        savedDownloads.set(entry.key, entry);
+      }
+    }
+  } catch {
+    // Best effort only.
+  }
+}
+
+async function rememberSavedDownload(job, filePath) {
+  const key = downloadKey(job);
+  if (!key || typeof filePath !== 'string' || !filePath) return;
+  savedDownloads.set(key, {key, path: filePath, at: Date.now()});
+  const entries = [...savedDownloads.values()].slice(-100);
+  try {
+    await chrome.storage.local.set({savedDownloads: entries});
+  } catch {
+    // Best effort only.
+  }
+}
+
+async function desktopFileExists(filePath) {
+  if (typeof filePath !== 'string' || !filePath) return false;
+  try {
+    const result = await chrome.runtime.sendNativeMessage(desktopHost, {
+      action: 'source-exists', source: filePath,
+    });
+    return Boolean(result?.ok && result.exists);
+  } catch {
+    return false;
+  }
+}
 let actions = Promise.resolve();
 
 function readJob() {
@@ -336,6 +386,8 @@ async function releasePdf(blobUrl) {
 }
 
 async function saveVerified(job, blobUrl) {
+  // Never start a second download for the same job once saving has begun.
+  if (Number.isInteger(job.downloadId) || job.stagedFile || job.phase === 'transfer' || job.phase === 'desktop') return job;
   try {
     const filename = await pdfFilename(job);
     const pending = await updateJob(job, {phase: 'transfer', blobUrl, message: 'PDF 已校验，正在保存…'});
@@ -369,13 +421,41 @@ async function inspectDownload(job) {
 }
 
 async function saveToDesktop(job) {
+  await loadSavedDownloads();
+  const key = downloadKey(job);
+  const previous = key ? savedDownloads.get(key) : null;
+  if (previous?.path && await desktopFileExists(previous.path)) {
+    // This paper is already on the Desktop (e.g. a duplicated recovery run):
+    // finish the job directly instead of saving a second copy.
+    const placed = await updateJob(job, {phase: 'cleanup', filename: previous.path});
+    return finishDesktopSave(placed);
+  }
+  if (previous) savedDownloads.delete(key);
+
+  if (key && saveLocks.has(key)) {
+    const result = await saveLocks.get(key).catch(() => null);
+    if (result?.ok && typeof result.path === 'string' && result.path) {
+      const placed = await updateJob(job, {phase: 'cleanup', filename: result.path});
+      await rememberSavedDownload(job, result.path);
+      return finishDesktopSave(placed);
+    }
+  }
+
   let response;
+  const pendingSave = (async () => {
+    try {
+      return await chrome.runtime.sendNativeMessage(desktopHost, {
+        action: 'save', source: job.stagedFile, title: job.title || '',
+      });
+    } catch {
+      return null;
+    }
+  })();
+  if (key) saveLocks.set(key, pendingSave);
   try {
-    response = await chrome.runtime.sendNativeMessage(desktopHost, {
-      action: 'save', source: job.stagedFile, title: job.title || '',
-    });
-  } catch {
-    // The browser has the file already. Retrying the Desktop step uses this same file.
+    response = await pendingSave;
+  } finally {
+    if (key) saveLocks.delete(key);
   }
   if (!response?.ok || typeof response.path !== 'string' || !response.path) {
     if (job.browserDownload && response?.reason === 'invalid_pdf') {
@@ -391,6 +471,7 @@ async function saveToDesktop(job) {
     return updateJob(job, {status: 'attention', canRetry: true, message});
   }
 
+  await rememberSavedDownload(job, response.path);
   const placed = await updateJob(job, {phase: 'cleanup', filename: response.path});
   return finishDesktopSave(placed);
 }
@@ -415,10 +496,11 @@ async function finishDesktopSave(job) {
   }
   if (job.browserDownload) await chrome.alarms.clear(browserWatchdog);
   await closeReaderTab(job, {force: true});
+  await restorePaperTab(job);
   stopFakerQuietly();
   return updateJob(job, {
     status: 'complete', phase: null, stagedFile: null, readerTabId: null,
-    awaitingBrowserDownload: false, browserDownload: false,
+    readerReusedPaperTab: false, awaitingBrowserDownload: false, browserDownload: false,
     message: job.title ? `已保存到桌面《${job.title}》` : '论文 PDF 已保存到桌面。',
   });
 }
@@ -466,7 +548,25 @@ async function closeReaderTab(job, options = {}) {
   if (Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
 }
 
+async function restorePaperTab(job) {
+  if (!job?.readerReusedPaperTab || !Number.isInteger(job.tabId)) return;
+  const url = job.targetUrl || (job.pii ? canonicalArticle(job.pii) : '');
+  if (!url) return;
+  await chrome.tabs.update(job.tabId, {url, active: true}).catch(() => {});
+}
+
 async function awaitBrowserDownload(job, page) {
+  // Never open another reader tab while one is already waiting for its
+  // download: repeated auto-recovery used to fetch the same PDF several times.
+  if (job.awaitingBrowserDownload && Number.isInteger(job.readerTabId)) {
+    const existing = await chrome.tabs.get(job.readerTabId).catch(() => null);
+    if (existing) {
+      if (!existing.active) await chrome.tabs.update(existing.id, {active: true}).catch(() => {});
+      return job;
+    }
+    job = {...job, readerTabId: null};
+  }
+  if ((job.manualDownloadIds || []).length > 0 || Number.isInteger(job.downloadId)) return job;
   const watchStartedAt = Date.now();
   if (page.kind === 'viewer' && page.pii === job.pii) {
     job = {...job, manualReader: true};
@@ -486,9 +586,14 @@ async function awaitBrowserDownload(job, page) {
   const url = officialPdf(page.pdfUrl, job.pii) || await resolvePdf(job);
   if (!url) return next;
 
-  // Register the download before navigating, so an inline PDF or immediate
-  // attachment can be saved from the publisher's normal document response.
-  const reader = await chrome.tabs.create({url: 'about:blank', openerTabId: job.tabId, active: false}).catch(() => null);
+  // v2.6: prefer downloading through the current paper tab instead of opening
+  // a new blank tab. The DNR rule turns the PDF response into an attachment,
+  // so Edge starts the download while the tab is restored afterwards.
+  const paperTab = Number.isInteger(job.tabId) ? await chrome.tabs.get(job.tabId).catch(() => null) : null;
+  const reusePaperTab = Boolean(paperTab);
+  const reader = reusePaperTab
+    ? paperTab
+    : await chrome.tabs.create({url: 'about:blank', openerTabId: job.tabId, active: false}).catch(() => null);
   if (!reader) return next;
   let automatic = true;
   try {
@@ -500,6 +605,7 @@ async function awaitBrowserDownload(job, page) {
   }
   const pending = await updateJob(next, {
     readerTabId: reader.id,
+    readerReusedPaperTab: reusePaperTab,
     message: automatic
       ? '已打开 ScienceDirect 的官方 PDF 链接，正在等待 Edge 下载并校验 PDF。'
       : '已打开 ScienceDirect 的官方 PDF 链接。若进入 Edge 阅读器，请点右上角「保存」。',
@@ -509,8 +615,13 @@ async function awaitBrowserDownload(job, page) {
     return pending;
   } catch {
     await clearReaderDownloadRule();
-    await chrome.tabs.remove(reader.id).catch(() => {});
-    return updateJob(next, {readerTabId: null});
+    if (reusePaperTab) {
+      // Never close the user's paper tab; put it back on the article page.
+      await restorePaperTab({...next, readerReusedPaperTab: true});
+    } else {
+      await chrome.tabs.remove(reader.id).catch(() => {});
+    }
+    return updateJob(next, {readerTabId: null, readerReusedPaperTab: false});
   }
 }
 
@@ -544,6 +655,7 @@ async function captureBrowserDownload(id) {
   await clearReaderDownloadRule();
   await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
   await closeReaderTab(job, {force: true});
+  await restorePaperTab(job);
   stopFakerQuietly();
   const next = await updateJob(job, {
     status: 'working', phase: 'desktop', awaitingBrowserDownload: false, browserDownload: true,
@@ -559,6 +671,7 @@ async function expireBrowserWatch() {
   if (job.status !== 'attention' || job.phase !== 'manual-download' || Date.now() < job.watchDeadline) return;
   await clearReaderDownloadRule();
   await closeReaderTab(job, {force: true});
+  await restorePaperTab(job);
   return updateJob(job, {
     phase: null, awaitingBrowserDownload: false, canRetry: false, readerTabId: null,
     message: '等待 Edge 下载已超时。需要自动保存到桌面时，请重新提交这篇论文。',
@@ -711,6 +824,9 @@ async function downloadPaper(job, page) {
   if (job.doi && page.doi && job.doi.toLowerCase() !== page.doi.toLowerCase()) {
     return fail(job, '打开的论文与输入的 DOI 不一致。请核对 DOI。');
   }
+  // A duplicate recovery run must continue saving, never download a second copy.
+  if (job.stagedFile) return saveToDesktop(job);
+  if (Number.isInteger(job.downloadId)) return inspectDownload(job);
 
   const paper = {...job, pii: page.pii, targetUrl: job.targetUrl || canonicalArticle(page.pii)};
   const title = page.kind === 'viewer' ? await titleForReader(paper, page) : page.title || job.title;
@@ -1381,3 +1497,4 @@ chrome.runtime.onInstalled.addListener((details) => {
 });
 
 initFaker();
+void loadSavedDownloads();

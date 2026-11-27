@@ -177,6 +177,9 @@
 
   async function finish(session, outcome) {
     if (!session || sessions.get(session.tabId) !== session) return;
+    // Let an in-flight click finish before detaching; otherwise Edge reports
+    // "Debugger is not attached" and the content script waits for a reply.
+    for (let attempt = 0; attempt < 20 && session.clicking; attempt += 1) await wait(50);
     sessions.delete(session.tabId);
     clearAlarm(session);
     sendToTab(session.tabId, {type: 'sd:faker-disarm', sessionId: session.id});
@@ -333,7 +336,7 @@
       // A transient "Detached while handling command" error (Edge/DevTools
       // hiccup) must not abort the whole verification: keep the session alive
       // and let the content script's next scheduled click retry the attach.
-      const transient = /detach|detached|closed|Target closed|No tab/i.test(error?.message || '');
+      const transient = /detach|detached|closed|Target closed|No tab|not attached|attach/i.test(error?.message || '');
       if (!transient) {
         await sendToTab(session.tabId, {type: 'sd:faker-click-result', ok: false, reason: 'debugger_error'});
         await finish(session, 'debugger_error');
@@ -368,7 +371,8 @@
     session.reloads += 1;
     session.phase = 'reloading';
     session.challengeSeen = session.challengeSeen || stalledReason === 'no_widget';
-    await detachDebugger(session.tabId);
+    // Keep the debugger attached across the navigation: re-attaching on every
+    // retry was a major source of the delayed first click on real sites.
     try {
       await chrome.tabs.reload(session.tabId, {bypassCache: true});
       log(`reloading tab ${session.tabId} to retry verification`, {reloads: session.reloads});
@@ -415,6 +419,7 @@
       challengeSeen: false,
       stalledReported: false,
       clicking: false,
+      finishing: false,
       debuggerLost: false,
       keepDebugger: false,
       attachPromise: null,
@@ -505,21 +510,40 @@
     return false;
   }
 
+  async function probeTabState(tabId) {
+    try {
+      return await chrome.tabs.sendMessage(tabId, {type: 'sd:faker-probe'});
+    } catch {
+      return null;
+    }
+  }
+
   async function onTabUpdated(tabId, changes) {
     const session = sessions.get(tabId);
     if (!session) return;
     if (changes?.status !== 'complete') return;
 
-    session.stalledReported = false;
     const tab = await getTab(tabId);
     if (!tab) {
       await finish(session, 'tab_closed');
       return;
     }
-    const tabUrl = tab.url || '';
-    if (session.challengeSeen && core.isFakerHost(tabUrl) && !core.isChallengeUrl(tabUrl)) {
-      log('challenge page navigated away; treating verification as cleared.');
+    session.stalledReported = false;
+    // v2.6: the URL alone cannot prove the challenge is gone (Cloudflare often
+    // strips its token from the address bar). Ask the page for the live state.
+    let probe = await probeTabState(tabId);
+    if (!probe) {
+      await wait(500);
+      probe = await probeTabState(tabId);
+    }
+    if (probe && probe.state && probe.state.detected === false) {
+      log('page state reports the challenge is cleared.');
       await finish(session, 'cleared');
+      return;
+    }
+    if (!probe && session.reason === 'reader') {
+      // Reader tab has no faker content script (direct PDF): nothing to click.
+      await finish(session, 'no_target');
       return;
     }
     await arm(session);
