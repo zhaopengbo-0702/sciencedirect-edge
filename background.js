@@ -17,9 +17,10 @@ const autoRecoverAlarm = 'scienceDirectAutoRecover';
 const autoRecoverDelays = [15000, 30000, 60000, 120000];
 // Verification failures retry for much longer: Cloudflare challenges can take
 // a while to clear, and the user explicitly wants no manual intervention.
-const autoVerificationDelays = [15000, 30000, 60000, 120000, 180000, 300000, 300000, 300000];
+// The first retries are fast so a challenged tab recovers quickly.
+const autoVerificationDelays = [5000, 10000, 20000, 40000, 90000, 180000, 300000, 300000];
 const autoDownloadRetries = 3;
-const autoDownloadRetryDelay = 25000;
+const autoDownloadRetryDelay = 12000;
 const stateKey = 'downloadJob';
 const watchdog = 'scienceDirectDownload';
 const browserWatchdog = 'scienceDirectBrowserDownload';
@@ -1021,7 +1022,7 @@ async function continueAfterFakerCleared(job) {
     return next;
   }
 
-  const page = await waitForPage(cleared, 8000);
+  const page = await waitForPage(cleared, 2500);
   if (page.kind === 'closed') return pause(cleared, '论文标签页已关闭，正在尝试自动重新打开…');
   if (page.kind === 'waiting') return resumeJob(cleared, false, true);
   if (['challenge', 'access'].includes(page.kind)) {

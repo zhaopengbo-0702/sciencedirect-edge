@@ -12,7 +12,7 @@
   const core = globalThis.SDFakerCore;
   const SETTINGS_KEY = 'fakerSettings';
   const ALARM_PREFIX = 'sd-faker-';
-  const CLICK_COOLDOWN_MS = 900;
+  const CLICK_COOLDOWN_MS = 500;
   const MAX_POINTS = 8;
   const MAX_COORDINATE = 10000;
 
@@ -131,7 +131,7 @@
         return true;
       } catch (error) {
         warn(`debugger attach failed for tab ${session.tabId} (attempt ${attempt}):`, error?.message || error);
-        if (attempt < 3) await wait(400 * attempt);
+        if (attempt < 3) await wait(250 * attempt);
       }
     }
     return false;

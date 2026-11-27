@@ -20,8 +20,8 @@
     const armDelayLimit = Number.isFinite(LIMITS.armDelayMs) && LIMITS.armDelayMs >= 0 ? LIMITS.armDelayMs : 1200;
     const stateIntervalLimit = Number.isFinite(LIMITS.stateIntervalMs) && LIMITS.stateIntervalMs > 0 ? LIMITS.stateIntervalMs : 900;
 
-    const mutationThrottleMs = 400;
-    const fallbackPollMs = 1500;
+    const mutationThrottleMs = 250;
+    const fallbackPollMs = 800;
     const scrollSettleMs = 120;
     const widgetWatchdogMs = 12000;
     const frameSelector = 'iframe[src*="challenges.cloudflare.com"], iframe[src*="challenge-platform"]';
