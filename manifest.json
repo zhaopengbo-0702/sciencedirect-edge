@@ -1,26 +1,49 @@
 {
   "manifest_version": 3,
   "name": "ScienceDirect 论文下载助手",
-  "version": "2.6",
+  "version": "2.7",
   "description": "按题名、DOI 或链接查找一篇 ScienceDirect 论文，并使用 Edge 中已有的访问权限下载正文 PDF。",
-  "permissions": ["storage", "downloads", "alarms", "offscreen", "nativeMessaging", "declarativeNetRequestWithHostAccess", "debugger"],
+  "permissions": [
+    "storage",
+    "downloads",
+    "alarms",
+    "offscreen",
+    "nativeMessaging",
+    "declarativeNetRequestWithHostAccess",
+    "debugger",
+    "scripting"
+  ],
   "host_permissions": [
     "https://*.sciencedirect.com/*",
     "https://pdf.sciencedirectassets.com/*",
     "https://ac.els-cdn.com/*",
     "https://ars.els-cdn.com/*"
   ],
-  "background": {"service_worker": "background.js"},
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_title": "ScienceDirect 论文下载助手",
     "default_popup": "popup.html",
-    "default_icon": {"16": "icons/16.png", "32": "icons/32.png"}
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png"
+    }
   },
-  "icons": {"16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png"},
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
   "content_scripts": [
     {
-      "matches": ["https://*.sciencedirect.com/*"],
-      "js": ["page.js"],
+      "matches": [
+        "https://*.sciencedirect.com/*"
+      ],
+      "js": [
+        "page.js"
+      ],
       "run_at": "document_idle"
     },
     {
@@ -30,12 +53,19 @@
         "https://ac.els-cdn.com/*",
         "https://ars.els-cdn.com/*"
       ],
-      "js": ["faker-core.js", "faker-content.js"],
+      "js": [
+        "faker-core.js",
+        "faker-content.js"
+      ],
       "run_at": "document_start"
     },
     {
-      "matches": ["https://*.sciencedirect.com/*"],
-      "js": ["panel.js"],
+      "matches": [
+        "https://*.sciencedirect.com/*"
+      ],
+      "js": [
+        "panel.js"
+      ],
       "run_at": "document_idle"
     }
   ]

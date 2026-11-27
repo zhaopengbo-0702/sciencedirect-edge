@@ -1,6 +1,10 @@
 (() => {
   'use strict';
 
+  // Guard against double injection (manual scripting.executeScript after reload).
+  if (globalThis.__sdPageHelperLoaded) return;
+  globalThis.__sdPageHelperLoaded = true;
+
   const scienceDirectHosts = new Set(['www.sciencedirect.com', 'sciencedirect.com']);
   const pdfHosts = new Set(['pdf.sciencedirectassets.com', 'ars.els-cdn.com', 'ac.els-cdn.com']);
   const articlePath = /^\/science\/article\/(?:abs\/)?pii\/([a-z0-9]{8,36})\/?$/i;

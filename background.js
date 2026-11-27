@@ -90,6 +90,47 @@ async function desktopFileExists(filePath) {
     return false;
   }
 }
+
+// v2.7: a cross-tab guard so several refreshed pages cannot start downloading
+// the same paper at the same time. The claim is persisted (service worker may
+// restart) and expires automatically.
+let downloadClaim = {key: '', claimId: '', at: 0};
+const DOWNLOAD_CLAIM_TTL = 180000;
+
+async function acquireDownloadClaim(job) {
+  const key = downloadKey(job);
+  if (!key) return true;
+  const claimId = String(job.claimId || '');
+  let stored = downloadClaim;
+  try {
+    stored = (await chrome.storage.local.get('downloadClaim')).downloadClaim || stored;
+  } catch {
+    // Use the in-memory value.
+  }
+  const now = Date.now();
+  const heldByOther = stored && stored.key && stored.key === key &&
+    stored.claimId && stored.claimId !== claimId && now - Number(stored.at || 0) < DOWNLOAD_CLAIM_TTL;
+  if (heldByOther) return false;
+  const claim = {key, claimId, at: now};
+  downloadClaim = claim;
+  try {
+    await chrome.storage.local.set({downloadClaim: claim});
+  } catch {
+    // Best effort only.
+  }
+  return true;
+}
+
+async function releaseDownloadClaim(job) {
+  const claimId = String(job?.claimId || '');
+  if (!claimId || downloadClaim.claimId !== claimId) return;
+  downloadClaim = {key: '', claimId: '', at: 0};
+  try {
+    await chrome.storage.local.remove('downloadClaim');
+  } catch {
+    // Best effort only.
+  }
+}
 let actions = Promise.resolve();
 
 function readJob() {
@@ -102,7 +143,11 @@ function popupState(job) {
 
 async function updateJob(job, changes) {
   const next = {...job, ...changes};
-  if (next.status !== 'working') await chrome.alarms.clear(watchdog);
+  if (next.status !== 'working') {
+    await chrome.alarms.clear(watchdog);
+    // v2.7: a paused/completed job must release the cross-tab download claim.
+    await releaseDownloadClaim(next);
+  }
   await chrome.storage.session.set({[stateKey]: next});
   if (next.status === 'attention') void scheduleAutoRecovery(next);
   else void chrome.alarms.clear(autoRecoverAlarm).catch(() => {});
@@ -230,27 +275,56 @@ async function readPage(job, tabId = job.tabId) {
     const existingPdf = officialPdf(tab.url, job.pii);
     if (tab.status === 'loading' && tab.pendingUrl && tab.pendingUrl !== tab.url) return {kind: 'waiting'};
     if (url && publisherHosts.has(url.hostname)) {
+      let page = null;
       try {
-        const page = await chrome.tabs.sendMessage(tab.id, {type: 'sd:inspect'});
-        // Other content scripts (e.g. the Cloudflare Faker watcher) may also be
-        // listening, in which case sendMessage can resolve with `undefined`
-        // before page.js is injected. Treat that as "still loading" instead of
-        // misreading the tab as a page without content.
-        if (page && typeof page === 'object' && typeof page.kind === 'string') {
-          return {...page, url};
-        }
-        return {kind: 'waiting', url, loaded: tab.status === 'complete'};
+        page = await chrome.tabs.sendMessage(tab.id, {type: 'sd:inspect'});
       } catch {
-        if (existingPdf && tab.status === 'complete') {
-          return {kind: 'viewer', url, pdfUrl: existingPdf, pii: job.pii, uninspected: true};
-        }
-        return {kind: 'waiting', url, loaded: tab.status === 'complete'};
+        page = null;
       }
+      if (!page || typeof page.kind !== 'string') {
+        // v2.7: after the extension is reloaded, content scripts in tabs that
+        // were already open stop working. Inject the page scripts on demand so
+        // the task no longer waits forever on "正在读取 ScienceDirect 页面…".
+        if (await injectPageScripts(tab.id)) {
+          try {
+            page = await chrome.tabs.sendMessage(tab.id, {type: 'sd:inspect'});
+          } catch {
+            page = null;
+          }
+        }
+      }
+      if (page && typeof page === 'object' && typeof page.kind === 'string') {
+        return {...page, url};
+      }
+      if (existingPdf && tab.status === 'complete') {
+        return {kind: 'viewer', url, pdfUrl: existingPdf, pii: job.pii, uninspected: true};
+      }
+      return {kind: 'waiting', url, loaded: tab.status === 'complete'};
     }
     if (existingPdf) return {kind: 'viewer', url, pdfUrl: existingPdf, pii: job.pii, uninspected: true};
     return {kind: 'waiting', outside: tab.status === 'complete'};
   } catch {
     return {kind: 'closed'};
+  }
+}
+
+const injectedTabs = new Set();
+
+async function injectPageScripts(tabId) {
+  if (!Number.isInteger(tabId) || injectedTabs.has(tabId)) return false;
+  if (!chrome.scripting?.executeScript) return false;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const url = parseUrl(tab.url);
+    if (!url || !publisherHosts.has(url.hostname)) return false;
+    await chrome.scripting.executeScript({
+      target: {tabId},
+      files: ['page.js', 'faker-core.js', 'faker-content.js', 'panel.js'],
+    });
+    injectedTabs.add(tabId);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -541,8 +615,10 @@ async function closeReaderTab(job, options = {}) {
   const tab = await chrome.tabs.get(job.readerTabId).catch(() => null);
   if (!tab) return;
   const url = tab.url || tab.pendingUrl || '';
-  const disposable = options.force === true || !url || url === 'about:blank' ||
-    /^(?:chrome-extension|edge):\/\//i.test(url);
+  // v2.7: only ever close tabs that are still blank or extension-internal.
+  // A paper page, PDF viewer or search page is never removed after download.
+  const disposable = !url || url === 'about:blank' ||
+    /^(?:chrome-extension|edge):\/\//i.test(url) || /^chrome:\/\/(?:newtab|downloads)\b/i.test(url);
   if (!disposable) return;
   await chrome.tabs.remove(job.readerTabId).catch(() => {});
   if (Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
@@ -550,9 +626,14 @@ async function closeReaderTab(job, options = {}) {
 
 async function restorePaperTab(job) {
   if (!job?.readerReusedPaperTab || !Number.isInteger(job.tabId)) return;
-  const url = job.targetUrl || (job.pii ? canonicalArticle(job.pii) : '');
-  if (!url) return;
-  await chrome.tabs.update(job.tabId, {url, active: true}).catch(() => {});
+  const tab = await chrome.tabs.get(job.tabId).catch(() => null);
+  const url = tab?.url || tab?.pendingUrl || '';
+  // Only fill a blank tab with the paper page; never navigate away a page the
+  // user can see (PDF viewer / article page stay exactly where they are).
+  if (url && url !== 'about:blank') return;
+  const target = job.targetUrl || (job.pii ? canonicalArticle(job.pii) : '');
+  if (!target) return;
+  await chrome.tabs.update(job.tabId, {url: target, active: true}).catch(() => {});
 }
 
 async function awaitBrowserDownload(job, page) {
@@ -567,6 +648,15 @@ async function awaitBrowserDownload(job, page) {
     job = {...job, readerTabId: null};
   }
   if ((job.manualDownloadIds || []).length > 0 || Number.isInteger(job.downloadId)) return job;
+  const latest = await readJob();
+  if (latest?.status === 'complete') return latest;
+  job = latest || job;
+  if (!(await acquireDownloadClaim(job))) {
+    return updateJob(job, {
+      status: 'attention', phase: 'page', canRetry: true,
+      message: '同一篇论文正在另一个页面下载，已避免重复保存。稍后会自动重试。',
+    });
+  }
   const watchStartedAt = Date.now();
   if (page.kind === 'viewer' && page.pii === job.pii) {
     job = {...job, manualReader: true};
@@ -619,7 +709,7 @@ async function awaitBrowserDownload(job, page) {
       // Never close the user's paper tab; put it back on the article page.
       await restorePaperTab({...next, readerReusedPaperTab: true});
     } else {
-      await chrome.tabs.remove(reader.id).catch(() => {});
+      await closeReaderTab({...next, readerTabId: reader.id});
     }
     return updateJob(next, {readerTabId: null, readerReusedPaperTab: false});
   }
@@ -828,6 +918,20 @@ async function downloadPaper(job, page) {
   if (job.stagedFile) return saveToDesktop(job);
   if (Number.isInteger(job.downloadId)) return inspectDownload(job);
 
+  // v2.7: give duplicate recovery runs a moment to converge, then take the
+  // cross-tab claim. This is the last line of defence against two refreshed
+  // pages fetching/saving the same PDF at the same time.
+  await new Promise((resolve) => setTimeout(resolve, 1200 + Math.floor(Math.random() * 800)));
+  const latest = await readJob();
+  if (latest?.status === 'complete') return latest;
+  job = latest || job;
+  if (!(await acquireDownloadClaim(job))) {
+    return updateJob(job, {
+      status: 'attention', phase: 'page', canRetry: true,
+      message: '同一篇论文正在另一个页面下载，已避免重复保存。稍后会自动重试。',
+    });
+  }
+
   const paper = {...job, pii: page.pii, targetUrl: job.targetUrl || canonicalArticle(page.pii)};
   const title = page.kind === 'viewer' ? await titleForReader(paper, page) : page.title || job.title;
   if (!title) return pause(paper, '暂时无法读取论文完整标题。请打开这篇论文的详情页，再点「下载当前页 PDF」。');
@@ -1017,7 +1121,7 @@ async function retryManualDownload(job) {
         message: '自动重试多次仍未触发 Edge 下载。请在论文页点「View PDF」，再点阅读器右上角下载按钮；或点「继续下载」重试保存。',
       });
     }
-    if (Number.isInteger(job.readerTabId)) await chrome.tabs.remove(job.readerTabId).catch(() => {});
+    if (Number.isInteger(job.readerTabId)) await closeReaderTab({...job, tabId: job.readerTabId});
     await clearReaderDownloadRule();
     const next = await updateJob(job, {
       status: 'working', phase: 'page', readerTabId: null, awaitingBrowserDownload: false,
@@ -1187,6 +1291,10 @@ function initFaker() {
     async onCleared(session) {
       const job = await readJob();
       if (job.faker?.sessionId !== session.id) return;
+      // v2.7: ignore a stale tab whose verification finished after the job was
+      // moved to another tab — otherwise several tabs resume the same job and
+      // fetch the same PDF at the same time.
+      if (session.reason !== 'reader' && Number.isInteger(job.tabId) && job.tabId !== session.tabId) return;
       const cleared = {...job, faker: null};
       if (session.reason === 'reader') {
         if (cleared.status === 'attention' && cleared.phase === 'manual-download') {
@@ -1204,6 +1312,7 @@ function initFaker() {
     async onFailed(session, reason) {
       const job = await readJob();
       if (job.faker?.sessionId !== session.id) return;
+      if (session.reason !== 'reader' && Number.isInteger(job.tabId) && job.tabId !== session.tabId) return;
       const cleaned = {...job, faker: null};
       if (session.reason === 'reader') {
         if (cleaned.status !== 'attention' || cleaned.phase !== 'manual-download') {
@@ -1315,7 +1424,8 @@ function run(job) {
         if (following.phase !== 'page' || following.targetUrl === current.targetUrl) break;
         current = following;
       }
-    } catch {
+    } catch (error) {
+      console.warn('download flight failed:', error?.message || error);
       await fail(await readJob(), '下载过程遇到问题。请打开论文页面后重试。');
     } finally {
       flight = null;
@@ -1339,7 +1449,11 @@ async function start(job, message) {
     status: 'working', phase: 'page', message: loadingMessage,
     autoRecoverCount: 0, autoDownloadRetryCount: 0,
     autoRecoverNotice: false, autoRecoverExhausted: false, pausedFromPhase: null,
+    claimId: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
   };
+  // A new task must not inherit a stale duplicate-download claim from an old one.
+  downloadClaim = {key: '', claimId: '', at: 0};
+  void chrome.storage.local.remove('downloadClaim').catch(() => {});
   if (message.mode === 'current') {
     if (!Number.isInteger(message.tabId)) return fail(fresh, '请先在 Edge 打开 ScienceDirect 论文。');
     fresh.tabId = message.tabId;

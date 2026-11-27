@@ -1,6 +1,10 @@
 (() => {
   'use strict';
 
+  // Guard against double injection (manual scripting.executeScript after reload).
+  if (globalThis.__sdPanelLoaded) return;
+  globalThis.__sdPanelLoaded = true;
+
   // Always-on helper panel for ScienceDirect pages. It stays docked at the
   // top-right corner until the user closes it; a small chip can reopen it.
   // Only the ScienceDirect Edge extension injects this script and it only

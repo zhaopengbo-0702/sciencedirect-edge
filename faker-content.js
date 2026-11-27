@@ -1,6 +1,10 @@
 (() => {
   'use strict';
 
+  // Guard against double injection (manual scripting.executeScript after reload).
+  if (globalThis.__sdFakerContentLoaded) return;
+  globalThis.__sdFakerContentLoaded = true;
+
   try {
     boot();
   } catch {
