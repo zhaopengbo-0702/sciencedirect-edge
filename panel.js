@@ -41,8 +41,8 @@
         button { background: #202f3e !important; color: #edf4fc !important; border-color: #455b71 !important; }
         .primary { background: #a9d4f8 !important; color: #12273c !important; border-color: #a9d4f8 !important; }
         .card { background: #202f3e !important; }
-        .status-card, .settings { background: #202f3e !important; }
-        .kicker, .settings-title, .hint, .card span { color: #b2c4d5 !important; }
+        .status-card { background: #202f3e !important; }
+        .kicker, .card span { color: #b2c4d5 !important; }
         .version { color: #b2c4d5 !important; }
       }
       .head { display: flex; align-items: center; gap: 9px; padding: 10px 11px; border-bottom: 1px solid #cbd5e0; }
@@ -67,10 +67,6 @@
       .status { margin: 0; overflow-wrap: anywhere; }
       .actions { display: flex; flex-wrap: wrap; gap: 6px; }
       .actions button { flex: 1 1 auto; }
-      .settings { padding: 8px 9px; background: #edf3fa; border-radius: 7px; display: grid; gap: 6px; }
-      .settings-title { margin: 0; color: #4f6276; font-size: 11px; font-weight: 650; }
-      .check-row { display: flex; align-items: flex-start; gap: 7px; cursor: pointer; font-weight: 500; font-size: 12px; }
-      .check-row input[type="checkbox"] { width: 15px; height: 15px; min-height: 0; margin: 2px 0 0; padding: 0; accent-color: #174a78; flex: 0 0 15px; }
       .current { width: 100%; }
       .muted { color: #4f6276; font-size: 11px; }
       .row { display: grid; gap: 6px; }
@@ -87,7 +83,6 @@
       .candidates { display: grid; gap: 5px; max-height: 180px; overflow-y: auto; }
       .card { text-align: left; background: #edf3fa; border: 1px solid #cbd5e0; border-radius: 6px; padding: 6px 8px; font-weight: 500; display: grid; gap: 2px; cursor: pointer; }
       .card span { color: #4f6276; font-weight: 400; font-size: 11px; }
-      .hint { margin: 0; color: #4f6276; font-size: 11px; }
       .chip {
         position: fixed; top: 14px; right: 14px; width: 40px; height: 40px; border-radius: 50%;
         border: 1px solid #cbd5e0; background: #fbfcfe; color: #174a78; font: 650 13px/1 "Segoe UI", sans-serif;
@@ -125,12 +120,6 @@
           <button class="primary" id="submit">查找并下载 PDF</button>
         </div>
         <button id="current" class="current">下载当前页 PDF</button>
-        <div class="settings">
-          <p class="settings-title">Cloudflare 自动验证</p>
-          <label class="check-row"><input type="checkbox" id="faker-enabled"><span>自动通过 Cloudflare 人机验证</span></label>
-          <label class="check-row"><input type="checkbox" id="faker-click"><span>自动点击验证框（使用调试权限）</span></label>
-          <p class="hint">仅在 ScienceDirect 页面与下载任务中启用；自动处理失败时会暂停，等待手动完成验证。</p>
-        </div>
       </div>
     </div>
     <button class="chip" id="chip" title="打开 ScienceDirect 下载助手面板" hidden>SD</button>
@@ -148,12 +137,8 @@
     retry: shadow.getElementById('retry'),
     show: shadow.getElementById('show'),
     close: shadow.getElementById('close'),
-    fakerEnabled: shadow.getElementById('faker-enabled'),
-    fakerClick: shadow.getElementById('faker-click'),
     version: shadow.getElementById('version'),
   };
-
-  const settings = {enabled: true, autoClick: true};
 
   let state = {status: 'idle'};
   let hidden = false;
@@ -179,37 +164,6 @@
   function saveHidden(value) {
     try {
       chrome.storage.local.set({[HIDDEN_KEY]: value}).catch(() => {});
-    } catch {
-      // Ignore.
-    }
-  }
-
-  function normalizeSettings(value) {
-    const source = value && typeof value === 'object' ? value : {};
-    return {enabled: source.enabled !== false, autoClick: source.autoClick !== false};
-  }
-
-  function renderSettings() {
-    el.fakerEnabled.checked = settings.enabled;
-    el.fakerClick.checked = settings.autoClick;
-    el.fakerClick.disabled = !settings.enabled;
-  }
-
-  async function loadSettings() {
-    try {
-      const result = await chrome.storage.local.get('fakerSettings');
-      Object.assign(settings, normalizeSettings(result?.fakerSettings));
-    } catch {
-      Object.assign(settings, normalizeSettings(null));
-    }
-    renderSettings();
-  }
-
-  function saveSettings() {
-    try {
-      chrome.storage.local.set({
-        fakerSettings: {enabled: settings.enabled, autoClick: settings.autoClick},
-      }).catch(() => {});
     } catch {
       // Ignore.
     }
@@ -309,16 +263,6 @@
   el.current.addEventListener('click', () => void act({type: 'start', mode: 'current'}));
   el.retry.addEventListener('click', () => void act({type: 'retry'}));
   el.show.addEventListener('click', () => void act({type: 'show'}));
-  el.fakerEnabled.addEventListener('change', () => {
-    settings.enabled = el.fakerEnabled.checked;
-    renderSettings();
-    saveSettings();
-  });
-  el.fakerClick.addEventListener('change', () => {
-    settings.autoClick = el.fakerClick.checked;
-    renderSettings();
-    saveSettings();
-  });
 
   try {
     chrome.storage.onChanged.addListener((_changes, area) => {
@@ -335,7 +279,6 @@
   }
 
   void loadHidden();
-  void loadSettings();
   void refresh();
   refreshTimer = setInterval(() => {
     if (document.visibilityState === 'visible' && !hidden) void refresh();

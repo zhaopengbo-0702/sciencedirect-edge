@@ -101,23 +101,3 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 #candidates { display: grid; gap: 6px; margin-top: 9px; max-height: 242px; overflow-y: auto; }
 .candidate { text-align: left; overflow-wrap: anywhere; }
 .candidate span { display: block; font-size: 11px; color: var(--subtle); font-weight: 400; margin-top: 2px; }
-
-.settings { margin-top: 14px; padding: 10px; background: var(--card); border-radius: 8px; display: grid; gap: 7px; }
-.settings-title { margin: 0 0 1px; color: var(--subtle); font-size: 11px; font-weight: 650; letter-spacing: 0.02em; }
-.setting-row { display: flex; align-items: flex-start; gap: 8px; }
-.setting-row input[type="checkbox"] {
-  flex: 0 0 16px;
-  width: 16px;
-  height: 16px;
-  min-height: 0;
-  margin: 2px 0 0;
-  padding: 0;
-  border: 0;
-  background: none;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-.setting-row label { font-weight: 500; cursor: pointer; overflow-wrap: anywhere; }
-.setting-row input[type="checkbox"]:disabled,
-.setting-row input[type="checkbox"]:disabled + label { opacity: 0.55; cursor: default; }
-.settings-note { margin: 1px 0 0; color: var(--subtle); font-size: 11px; line-height: 1.45; }

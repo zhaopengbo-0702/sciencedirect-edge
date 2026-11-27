@@ -17,10 +17,10 @@ const autoRecoverAlarm = 'scienceDirectAutoRecover';
 const autoRecoverDelays = [15000, 30000, 60000, 120000];
 // Verification failures retry for much longer: Cloudflare challenges can take
 // a while to clear, and the user explicitly wants no manual intervention.
-// The first retries are fast so a challenged tab recovers quickly.
-const autoVerificationDelays = [5000, 10000, 20000, 40000, 90000, 180000, 300000, 300000];
+// The first retries are extremely fast so a challenged tab recovers quickly.
+const autoVerificationDelays = [3000, 6000, 12000, 25000, 60000, 120000, 300000, 300000];
 const autoDownloadRetries = 3;
-const autoDownloadRetryDelay = 12000;
+const autoDownloadRetryDelay = 6000;
 const stateKey = 'downloadJob';
 const watchdog = 'scienceDirectDownload';
 const browserWatchdog = 'scienceDirectBrowserDownload';
@@ -1022,7 +1022,9 @@ async function continueAfterFakerCleared(job) {
     return next;
   }
 
-  const page = await waitForPage(cleared, 2500);
+  // Extreme speed (v2.5): do not wait for the page to finish loading after the
+  // challenge clears — processJob will keep waiting for the real article page.
+  const page = await readPage(cleared);
   if (page.kind === 'closed') return pause(cleared, '论文标签页已关闭，正在尝试自动重新打开…');
   if (page.kind === 'waiting') return resumeJob(cleared, false, true);
   if (['challenge', 'access'].includes(page.kind)) {
@@ -1367,6 +1369,15 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === browserWatchdog) void enqueueAction(expireBrowserWatch);
   if (alarm.name === autoRecoverAlarm) void enqueueAction(runAutoRecovery);
   if (alarm.name.startsWith(fakerAlarmPrefix) && fakerEngine()) void SDFakerBackground.handleAlarm(alarm);
+});
+
+// The Faker settings UI was removed per user request; the feature stays on by
+// default and every install/update restores these defaults.
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details?.reason !== 'install' && details?.reason !== 'update') return;
+  void chrome.storage.local.set({
+    fakerSettings: {enabled: true, autoClick: true},
+  }).catch(() => {});
 });
 
 initFaker();

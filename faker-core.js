@@ -15,12 +15,12 @@
     // The user asked for "keep refreshing and retrying if it does not work":
     // eight refresh attempts per verification session, up to four minutes.
     maxReloads: 8,
-    // Latency tuning (v2.4): click soon after the widget appears and poll the
-    // challenge state more often so a solved challenge is noticed quickly.
-    clickIntervalMs: 1200,
-    armDelayMs: 400,
+    // Latency tuning (v2.5): extreme speed. Click almost immediately after the
+    // widget appears and poll challenge state very frequently.
+    clickIntervalMs: 800,
+    armDelayMs: 150,
     sessionTimeoutMs: 240000,
-    stateIntervalMs: 500,
+    stateIntervalMs: 250,
   });
 
   const CHALLENGE_URL_TOKENS = [
