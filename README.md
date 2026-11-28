@@ -1,6 +1,6 @@
-# ScienceDirect 论文下载助手 v3.1
+# ScienceDirect 论文下载助手 v3.2
 
-**当前版本：v3.1** ｜ [⬇ 下载最新版本](https://github.com/zhaopengbo-0702/sciencedirect-edge/releases/latest) ｜ 历史更新记录见 [CHANGELOG.md](CHANGELOG.md)
+**当前版本：v3.2** ｜ [⬇ 下载最新版本](https://github.com/zhaopengbo-0702/sciencedirect-edge/releases/latest) ｜ 历史更新记录见 [CHANGELOG.md](CHANGELOG.md)
 
 这是适用于 Microsoft Edge 的本地扩展。它一次处理一篇论文的正文 PDF。
 
@@ -38,7 +38,7 @@ GitHub Releases 的 `latest` 只提供**最新版本**安装包；历史版本�
 - 打开 ScienceDirect 页面时，扩展会在**右上角常驻一个「下载助手」面板**（固定位置、不随页面滚动移动）：可直接粘贴题名、DOI 或链接查找下载，下载当前页 PDF、选择候选论文、继续下载、在桌面上显示，并实时显示任务状态。
 - 工具栏弹窗与常驻面板顶部都会**显示当前版本号**（如 v2.4），版本号动态读取 manifest，以后每一版自动更新。
 - 点面板右上角 **×** 可手动关闭；关闭后右上角保留一个小圆钮「SD」，点击可重新打开。面板只出现在 ScienceDirect 相关页面。
-- 下载过程不会新开空白标签页；只有在原论文标签页已关闭时才会临时创建，并在完成后清理。
+- 下载过程**保留原论文标签页**：回退下载开始后会自动把论文页恢复回来，不会只剩空白页；只有原论文标签页已关闭时才临时创建新标签页并在完成后清理。
 
 ## Cloudflare 自动验证（CF Faker）
 

@@ -24,6 +24,7 @@ const autoDownloadRetryDelay = 12000;
 const stateKey = 'downloadJob';
 const watchdog = 'scienceDirectDownload';
 const browserWatchdog = 'scienceDirectBrowserDownload';
+const restorePaperAlarm = 'scienceDirectRestorePaper';
 const browserDownloadWindow = 15 * 60 * 1000;
 const readerDownloadRuleIds = [1, 2, 3];
 const desktopHost = 'org.sciencedirect_desktop.save';
@@ -414,7 +415,11 @@ async function finishDesktopSave(job) {
     }
   }
   if (job.browserDownload) await chrome.alarms.clear(browserWatchdog);
-  await closeReaderTab(job, {force: true});
+  await closeReaderTab(job);
+  await restorePaperTab(job, {force: true});
+  if (job.readerReusedPaperTab) {
+    try { await chrome.alarms.create(restorePaperAlarm, {when: Date.now() + 3000}); } catch { /* ignore */ }
+  }
   stopFakerQuietly();
   return updateJob(job, {
     status: 'complete', phase: null, stagedFile: null, readerTabId: null,
@@ -468,22 +473,36 @@ async function closeReaderTab(job) {
   if (Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
 }
 
-async function restorePaperTab(job) {
+async function restorePaperTab(job, options = {}) {
   if (!job?.readerReusedPaperTab || !Number.isInteger(job.tabId)) return;
   const tab = await chrome.tabs.get(job.tabId).catch(() => null);
-  if (!tab || (tab.pendingUrl && tab.pendingUrl !== tab.url)) return;
+  if (!tab) return;
   const currentUrl = tab.url || '';
   const originalUrl = job.paperTabUrl || job.targetUrl || (job.pii ? canonicalArticle(job.pii) : '');
   const original = parseUrl(originalUrl);
   if (!original || !publisherHosts.has(original.hostname) ||
       !articlePath.test(original.pathname) || paperPii(original) !== job.pii) return;
   if (currentUrl === originalUrl) return;
-  // Restore only when the download replaced the article in the same tab
-  // (PDF viewer / about:blank); a page the user is reading is never touched.
+  const pending = Boolean(tab.pendingUrl && tab.pendingUrl !== tab.url);
+  if (pending && !options.force) return;
   const pdfShown = Boolean(officialPdf(currentUrl, job.pii));
   const blank = !currentUrl || currentUrl === 'about:blank';
-  if (!pdfShown && !blank) return;
-  await chrome.tabs.update(job.tabId, {url: originalUrl}).catch(() => {});
+  if (!options.force && !pdfShown && !blank) return;
+  await chrome.tabs.update(job.tabId, {url: originalUrl, active: true}).catch(() => {});
+  console.log('restored the paper tab after browser download', {tabId: job.tabId, forced: options.force === true});
+}
+
+async function restorePaperTabForAlarm() {
+  const job = await readJob();
+  if (!job || !job.readerReusedPaperTab) {
+    try { await chrome.alarms.clear(restorePaperAlarm); } catch { /* ignore */ }
+    return;
+  }
+  await restorePaperTab(job, {force: true});
+  // A late safety restore: Edge can blank the tab a moment after the download
+  // navigation, so restore once more and only then clear the flag.
+  await updateJob(job, {readerReusedPaperTab: false, paperTabUrl: null}).catch(() => {});
+  try { await chrome.alarms.clear(restorePaperAlarm); } catch { /* ignore */ }
 }
 
 async function awaitBrowserDownload(job, page) {
@@ -545,11 +564,16 @@ async function awaitBrowserDownload(job, page) {
   });
   try {
     await chrome.tabs.update(reader.id, {url, active: true});
+    if (reusePaperTab) {
+      // Fallback: even if Edge blanks the tab during the download navigation,
+      // put the paper page back a few seconds later.
+      try { await chrome.alarms.create(restorePaperAlarm, {when: Date.now() + 6000}); } catch { /* ignore */ }
+    }
     return pending;
   } catch {
     await clearReaderDownloadRule();
     if (reusePaperTab) {
-      await restorePaperTab({...pending, readerReusedPaperTab: true});
+      await restorePaperTab({...pending, readerReusedPaperTab: true}, {force: true});
     } else {
       await closeReaderTab(pending);
     }
@@ -586,7 +610,11 @@ async function captureBrowserDownload(id) {
 
   await clearReaderDownloadRule();
   await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
-  await closeReaderTab(job, {force: true});
+  await closeReaderTab(job);
+  await restorePaperTab(job, {force: true});
+  if (job.readerReusedPaperTab) {
+    try { await chrome.alarms.create(restorePaperAlarm, {when: Date.now() + 3000}); } catch { /* ignore */ }
+  }
   stopFakerQuietly();
   const next = await updateJob(job, {
     status: 'working', phase: 'desktop', awaitingBrowserDownload: false, browserDownload: true,
@@ -601,7 +629,11 @@ async function expireBrowserWatch() {
   const job = await readJob();
   if (job.status !== 'attention' || job.phase !== 'manual-download' || Date.now() < job.watchDeadline) return;
   await clearReaderDownloadRule();
-  await closeReaderTab(job, {force: true});
+  await closeReaderTab(job);
+  await restorePaperTab(job, {force: true});
+  if (job.readerReusedPaperTab) {
+    try { await chrome.alarms.create(restorePaperAlarm, {when: Date.now() + 3000}); } catch { /* ignore */ }
+  }
   return updateJob(job, {
     phase: null, awaitingBrowserDownload: false, canRetry: false, readerTabId: null,
     message: '等待 Edge 下载已超时。需要自动保存到桌面时，请重新提交这篇论文。',
@@ -1392,7 +1424,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.downloads.onCreated.addListener((item) => {
-  if (item.state === 'complete') void enqueueAction(() => captureBrowserDownload(item.id));
+  void enqueueAction(async () => {
+    const job = await readJob();
+    if (job.awaitingBrowserDownload && job.readerReusedPaperTab) {
+      // The attachment download has started: bring the paper page back now.
+      try { await chrome.alarms.create(restorePaperAlarm, {when: Date.now() + 1200}); } catch { /* ignore */ }
+    }
+    if (item.state === 'complete') await captureBrowserDownload(item.id);
+  });
 });
 
 chrome.downloads.onChanged.addListener(({id, state}) => {
@@ -1408,6 +1447,7 @@ chrome.downloads.onChanged.addListener(({id, state}) => {
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === watchdog) void readJob().then(run);
   if (alarm.name === browserWatchdog) void enqueueAction(expireBrowserWatch);
+  if (alarm.name === restorePaperAlarm) void enqueueAction(restorePaperTabForAlarm);
   if (alarm.name === autoRecoverAlarm) void enqueueAction(runAutoRecovery);
   if (alarm.name.startsWith(fakerAlarmPrefix) && fakerEngine()) void SDFakerBackground.handleAlarm(alarm);
 });
