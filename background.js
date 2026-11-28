@@ -1369,13 +1369,4 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name.startsWith(fakerAlarmPrefix) && fakerEngine()) void SDFakerBackground.handleAlarm(alarm);
 });
 
-// The Faker settings UI was removed per user request; keep the feature on by
-// default and restore these defaults on every install/update.
-chrome.runtime.onInstalled.addListener((details) => {
-  if (details?.reason !== 'install' && details?.reason !== 'update') return;
-  void chrome.storage.local.set({
-    fakerSettings: {enabled: true, autoClick: true},
-  }).catch(() => {});
-});
-
 initFaker();
