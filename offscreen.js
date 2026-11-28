@@ -111,10 +111,6 @@ async function fetchPdf(url, pii) {
       await response.body?.cancel().catch(() => {});
       return {ok: false, reason: 'pdf_blocked'};
     }
-    if (response.status === 429) {
-      await response.body?.cancel().catch(() => {});
-      return {ok: false, reason: 'rate_limited'};
-    }
     const final = new URL(response.url);
     if (!articleHosts.has(final.hostname) && !cdnHosts.has(final.hostname)) {
       await response.body?.cancel().catch(() => {});

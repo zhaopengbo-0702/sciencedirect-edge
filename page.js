@@ -325,11 +325,7 @@
         await response.body?.cancel();
         return {ok: false, reason: 'access'};
       }
-      if (response.status === 429) {
-        await response.body?.cancel();
-        return {ok: false, reason: 'rate_limited'};
-      }
-      if (response.status === 408 || response.status >= 500) {
+      if (response.status === 408 || response.status === 429 || response.status >= 500) {
         await response.body?.cancel();
         return {ok: false, reason: 'transient_response'};
       }
