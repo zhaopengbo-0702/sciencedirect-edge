@@ -12,15 +12,15 @@
   const DEFAULT_SETTINGS = Object.freeze({enabled: true, autoClick: true});
   const LIMITS = Object.freeze({
     maxClicks: 5,
-    // v2.6: fewer reload cycles (the page reload itself is the slow part);
-    // automatic recovery keeps retrying afterwards with growing delays.
-    maxReloads: 4,
-    // Latency tuning (v2.5/v2.6): click almost immediately after the widget
-    // appears and poll challenge state very frequently.
-    clickIntervalMs: 800,
-    armDelayMs: 150,
+    // The user asked for "keep refreshing and retrying if it does not work":
+    // eight refresh attempts per verification session, up to four minutes.
+    maxReloads: 8,
+    // Latency tuning (v2.4): click soon after the widget appears and poll the
+    // challenge state more often so a solved challenge is noticed quickly.
+    clickIntervalMs: 1200,
+    armDelayMs: 400,
     sessionTimeoutMs: 240000,
-    stateIntervalMs: 250,
+    stateIntervalMs: 500,
   });
 
   const CHALLENGE_URL_TOKENS = [

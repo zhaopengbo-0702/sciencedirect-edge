@@ -1,10 +1,6 @@
 (() => {
   'use strict';
 
-  // Guard against double injection (manual scripting.executeScript after reload).
-  if (globalThis.__sdFakerContentLoaded) return;
-  globalThis.__sdFakerContentLoaded = true;
-
   try {
     boot();
   } catch {
@@ -24,11 +20,10 @@
     const armDelayLimit = Number.isFinite(LIMITS.armDelayMs) && LIMITS.armDelayMs >= 0 ? LIMITS.armDelayMs : 1200;
     const stateIntervalLimit = Number.isFinite(LIMITS.stateIntervalMs) && LIMITS.stateIntervalMs > 0 ? LIMITS.stateIntervalMs : 900;
 
-    const mutationThrottleMs = 150;
-    const fallbackPollMs = 400;
-    const scrollSettleMs = 100;
+    const mutationThrottleMs = 250;
+    const fallbackPollMs = 800;
+    const scrollSettleMs = 120;
     const widgetWatchdogMs = 12000;
-    const clickResponseTimeoutMs = 3000;
     const frameSelector = 'iframe[src*="challenges.cloudflare.com"], iframe[src*="challenge-platform"]';
 
     let armed = false;
@@ -39,7 +34,6 @@
     let stalledSent = false;
     let widgetSeen = false;
     let clickLoopActive = false;
-    let clickPending = false;
 
     let observer = null;
     let mutationTimer = 0;
@@ -51,7 +45,6 @@
     let settleTimer = 0;
     let budgetTimer = 0;
     let watchdogTimer = 0;
-    let responseTimer = 0;
 
     function guard(fn) {
       return function guarded() {
@@ -172,9 +165,6 @@
       } else if (name === 'watchdog' && watchdogTimer) {
         clearTimeout(watchdogTimer);
         watchdogTimer = 0;
-      } else if (name === 'response' && responseTimer) {
-        clearTimeout(responseTimer);
-        responseTimer = 0;
       }
     }
 
@@ -182,9 +172,7 @@
       clearTimer('click');
       clearTimer('settle');
       clearTimer('budget');
-      clearTimer('response');
       clickLoopActive = false;
-      clickPending = false;
     }
 
     function scheduleClick(delay) {
@@ -245,7 +233,6 @@
         clickLoopActive = false;
         return;
       }
-      if (clickPending) return;
       const detection = readDetection();
       if (!detection) {
         clickLoopActive = false;
@@ -263,23 +250,14 @@
       }
       const attempt = clicksSent + 1;
       clicksSent = attempt;
-      clickPending = true;
       // Background dispatches the real click and rotates candidates by attempt.
       send({type: 'sd:faker-click', sessionId, points, attempt});
-      // Wait for the background's acknowledgement before the next click, so the
-      // click budget is not burned by requests the debugger never dispatched
-      // (that used to trigger needless page reloads).
-      clearTimer('response');
-      responseTimer = setTimeout(guard(() => {
-        clearTimer('response');
-        if (!armed || stalledSent) return;
-        clickPending = false;
-        if (clicksSent >= limits.maxClicks) {
-          finishClickBudget();
-        } else {
-          scheduleClick(limits.clickIntervalMs);
-        }
-      }), clickResponseTimeoutMs);
+      if (clicksSent >= limits.maxClicks) {
+        clearTimer('budget');
+        budgetTimer = setTimeout(guard(finishClickBudget), limits.clickIntervalMs);
+      } else {
+        scheduleClick(limits.clickIntervalMs);
+      }
     }
 
     function finishClickBudget() {
@@ -432,53 +410,32 @@
       lastPresence = readDetection() ? 'challenge' : 'clear';
     }
 
-    function onMessage(message, sender, sendResponse) {
-      if (!message || typeof message !== 'object') return false;
+    function onMessage(message, sender) {
+      if (!message || typeof message !== 'object') return;
       try {
-        if (sender && sender.id && chrome.runtime && chrome.runtime.id && sender.id !== chrome.runtime.id) return false;
+        if (sender && sender.id && chrome.runtime && chrome.runtime.id && sender.id !== chrome.runtime.id) return;
       } catch {
-        return false;
+        return;
       }
       switch (message.type) {
-        case 'sd:faker-probe':
-          // Background asks for the live state after a navigation completes;
-          // the content script (not the URL) is the authority on whether the
-          // challenge is really gone.
-          if (typeof sendResponse === 'function') {
-            try {
-              sendResponse({state: readDetection(), armed, clicksSent});
-            } catch {
-              // Ignore.
-            }
-          }
-          return true;
         case 'sd:faker-arm':
           arm(message);
           break;
         case 'sd:faker-disarm':
-          if (message.sessionId && sessionId && message.sessionId !== sessionId) return false;
+          if (message.sessionId && sessionId && message.sessionId !== sessionId) return;
           disarm();
           break;
         case 'sd:faker-click-result':
-          if (!armed || stalledSent) return false;
-          clickPending = false;
-          clearTimer('response');
+          if (!armed || stalledSent) return;
           if (message.ok === false) {
             // User turned auto-click off in the popup: report the real reason
             // instead of a misleading debugger/permission failure.
             reportStalled(message.reason === 'auto_click_off' ? 'auto_click_off' : 'debugger_unavailable');
-            return false;
-          }
-          if (clicksSent >= limits.maxClicks) {
-            finishClickBudget();
-          } else {
-            scheduleClick(limits.clickIntervalMs);
           }
           break;
         default:
           break;
       }
-      return false;
     }
 
     // ---------------------------------------------------------------------
@@ -548,13 +505,13 @@
     }
 
     try {
-      chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      chrome.runtime.onMessage.addListener((message, sender) => {
         try {
-          return onMessage(message, sender, sendResponse) === true;
+          onMessage(message, sender);
         } catch {
           // A malformed message must never break the page.
-          return false;
         }
+        return false;
       });
     } catch {
       return;

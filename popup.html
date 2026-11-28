@@ -38,6 +38,19 @@
           <button type="button" id="show" hidden>在桌面上显示</button>
         </div>
       </section>
+
+      <section class="settings" aria-label="Cloudflare 自动验证设置">
+        <p class="settings-title">Cloudflare 自动验证</p>
+        <div class="setting-row">
+          <input type="checkbox" id="faker-enabled" checked>
+          <label for="faker-enabled">自动通过 Cloudflare 人机验证</label>
+        </div>
+        <div class="setting-row">
+          <input type="checkbox" id="faker-click" checked>
+          <label for="faker-click">自动点击验证框（使用调试权限）</label>
+        </div>
+        <p class="settings-note">仅在 ScienceDirect 页面与下载任务中启用；自动处理失败时会暂停，等待手动完成验证。</p>
+      </section>
     </main>
   </body>
 </html>

@@ -12,7 +12,7 @@
   const core = globalThis.SDFakerCore;
   const SETTINGS_KEY = 'fakerSettings';
   const ALARM_PREFIX = 'sd-faker-';
-  const CLICK_COOLDOWN_MS = 300;
+  const CLICK_COOLDOWN_MS = 500;
   const MAX_POINTS = 8;
   const MAX_COORDINATE = 10000;
 
@@ -137,18 +137,6 @@
     return false;
   }
 
-  // v2.5: attach the debugger when the session starts (and share the pending
-  // promise) so the first real click does not pay the attach latency.
-  function ensureDebugger(session) {
-    if (attachedTabs.has(session.tabId)) return Promise.resolve(true);
-    if (!session.attachPromise) {
-      session.attachPromise = attachDebugger(session).finally(() => {
-        session.attachPromise = null;
-      });
-    }
-    return session.attachPromise;
-  }
-
   async function detachDebugger(tabId) {
     if (!attachedTabs.has(tabId)) return;
     attachedTabs.delete(tabId);
@@ -177,9 +165,6 @@
 
   async function finish(session, outcome) {
     if (!session || sessions.get(session.tabId) !== session) return;
-    // Let an in-flight click finish before detaching; otherwise Edge reports
-    // "Debugger is not attached" and the content script waits for a reply.
-    for (let attempt = 0; attempt < 20 && session.clicking; attempt += 1) await wait(50);
     sessions.delete(session.tabId);
     clearAlarm(session);
     sendToTab(session.tabId, {type: 'sd:faker-disarm', sessionId: session.id});
@@ -262,7 +247,7 @@
 
     session.clicking = true;
     try {
-      const attached = await ensureDebugger(session);
+      const attached = await attachDebugger(session);
       if (!attached) {
         log('click skipped: debugger attach failed');
         await sendToTab(session.tabId, {type: 'sd:faker-click-result', ok: false, reason: 'debugger_unavailable'});
@@ -274,34 +259,25 @@
       const to = {x: Math.round(target.x), y: Math.round(target.y)};
       const from = session.mouse && Number.isFinite(session.mouse.x) ?
         session.mouse : {
-          x: Math.max(2, to.x - randomBetween(60, 110)),
-          y: Math.max(2, to.y - randomBetween(20, 60)),
+          x: Math.max(2, to.x - randomBetween(120, 220)),
+          y: Math.max(2, to.y - randomBetween(40, 110)),
         };
-      const rawPath = core.humanPointerPath(from, to).map((point) => ({
+      const path = core.humanPointerPath(from, to).map((point) => ({
         x: Math.min(MAX_COORDINATE, Math.max(1, Math.round(point.x))),
         y: Math.min(MAX_COORDINATE, Math.max(1, Math.round(point.y))),
       }));
-      // Extreme speed (v2.5): keep the curved look but only dispatch a few
-      // points, which keeps the click well under ~150 ms.
-      let path = rawPath;
-      if (path.length > 14) {
-        const step = Math.ceil(path.length / 14);
-        path = path.filter((_point, index) => index % step === 0);
-        path.push(to);
-      }
-      if (!path.length) path = [to];
-      path[path.length - 1] = to;
+      if (!path.length) path.push(to);
 
       for (const point of path) {
         await chrome.debugger.sendCommand({tabId: session.tabId}, 'Input.dispatchMouseEvent', {
           type: 'mouseMoved', x: point.x, y: point.y, button: 'none', buttons: 0, modifiers: 0,
         });
-        await wait(randomBetween(2, 5));
+        await wait(randomBetween(4, 12));
       }
       await chrome.debugger.sendCommand({tabId: session.tabId}, 'Input.dispatchMouseEvent', {
         type: 'mousePressed', x: to.x, y: to.y, button: 'left', buttons: 1, clickCount: 1, modifiers: 0,
       });
-      await wait(randomBetween(18, 40));
+      await wait(randomBetween(35, 80));
       await chrome.debugger.sendCommand({tabId: session.tabId}, 'Input.dispatchMouseEvent', {
         type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1, modifiers: 0,
       });
@@ -309,11 +285,11 @@
       // Keyboard fallback: a focused Turnstile checkbox can also be toggled
       // with Space. Some widget variants ignore synthetic mouse clicks.
       try {
-        await wait(randomBetween(15, 30));
+        await wait(randomBetween(30, 70));
         await chrome.debugger.sendCommand({tabId: session.tabId}, 'Input.dispatchKeyEvent', {
           type: 'keyDown', key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
         });
-        await wait(randomBetween(15, 30));
+        await wait(randomBetween(30, 80));
         await chrome.debugger.sendCommand({tabId: session.tabId}, 'Input.dispatchKeyEvent', {
           type: 'keyUp', key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
         });
@@ -336,7 +312,7 @@
       // A transient "Detached while handling command" error (Edge/DevTools
       // hiccup) must not abort the whole verification: keep the session alive
       // and let the content script's next scheduled click retry the attach.
-      const transient = /detach|detached|closed|Target closed|No tab|not attached|attach/i.test(error?.message || '');
+      const transient = /detach|detached|closed|Target closed|No tab/i.test(error?.message || '');
       if (!transient) {
         await sendToTab(session.tabId, {type: 'sd:faker-click-result', ok: false, reason: 'debugger_error'});
         await finish(session, 'debugger_error');
@@ -371,8 +347,7 @@
     session.reloads += 1;
     session.phase = 'reloading';
     session.challengeSeen = session.challengeSeen || stalledReason === 'no_widget';
-    // Keep the debugger attached across the navigation: re-attaching on every
-    // retry was a major source of the delayed first click on real sites.
+    await detachDebugger(session.tabId);
     try {
       await chrome.tabs.reload(session.tabId, {bypassCache: true});
       log(`reloading tab ${session.tabId} to retry verification`, {reloads: session.reloads});
@@ -419,10 +394,8 @@
       challengeSeen: false,
       stalledReported: false,
       clicking: false,
-      finishing: false,
       debuggerLost: false,
       keepDebugger: false,
-      attachPromise: null,
     };
     sessions.set(tabId, session);
 
@@ -444,8 +417,6 @@
     }
 
     log('starting session', {tabId, reason, sessionId: session.id});
-    // Attach eagerly so the first click after arming is dispatched immediately.
-    await ensureDebugger(session).catch(() => false);
     await callHook('onSessionStart', session);
     await arm(session);
     return session;
@@ -510,40 +481,21 @@
     return false;
   }
 
-  async function probeTabState(tabId) {
-    try {
-      return await chrome.tabs.sendMessage(tabId, {type: 'sd:faker-probe'});
-    } catch {
-      return null;
-    }
-  }
-
   async function onTabUpdated(tabId, changes) {
     const session = sessions.get(tabId);
     if (!session) return;
     if (changes?.status !== 'complete') return;
 
+    session.stalledReported = false;
     const tab = await getTab(tabId);
     if (!tab) {
       await finish(session, 'tab_closed');
       return;
     }
-    session.stalledReported = false;
-    // v2.6: the URL alone cannot prove the challenge is gone (Cloudflare often
-    // strips its token from the address bar). Ask the page for the live state.
-    let probe = await probeTabState(tabId);
-    if (!probe) {
-      await wait(500);
-      probe = await probeTabState(tabId);
-    }
-    if (probe && probe.state && probe.state.detected === false) {
-      log('page state reports the challenge is cleared.');
+    const tabUrl = tab.url || '';
+    if (session.challengeSeen && core.isFakerHost(tabUrl) && !core.isChallengeUrl(tabUrl)) {
+      log('challenge page navigated away; treating verification as cleared.');
       await finish(session, 'cleared');
-      return;
-    }
-    if (!probe && session.reason === 'reader') {
-      // Reader tab has no faker content script (direct PDF): nothing to click.
-      await finish(session, 'no_target');
       return;
     }
     await arm(session);
