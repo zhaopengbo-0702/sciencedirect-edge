@@ -1,6 +1,6 @@
-# ScienceDirect 论文下载助手 v4.0.3
+# ScienceDirect 论文下载助手 v4.0.4
 
-**当前版本：v4.0.3** ｜ [⬇ 下载最新版本](https://github.com/zhaopengbo-0702/sciencedirect-edge/releases/latest) ｜ 历史更新记录见 [CHANGELOG.md](CHANGELOG.md)
+**当前版本：v4.0.4** ｜ [⬇ 下载最新版本](https://github.com/zhaopengbo-0702/sciencedirect-edge/releases/latest) ｜ 历史更新记录见 [CHANGELOG.md](CHANGELOG.md)
 
 这是适用于 Microsoft Edge 的本地扩展。它一次处理一篇论文的正文 PDF。
 
@@ -11,9 +11,9 @@
 3. 点击 **加载解压缩的扩展**，选择解压后直接包含 `manifest.json` 的 `ScienceDirect-Edge` 文件夹。
 4. 在扩展文件夹里双击 `register-desktop-host.cmd` 注册桌面保存组件。从 Edge 工具栏的扩展菜单打开 **ScienceDirect 论文下载助手**。
 
-本扩展从 v4.0.3 起使用固定扩展 ID，桌面保存组件也放在用户目录（`%LOCALAPPDATA%\ScienceDirectEdge`）。首次安装运行一次 `register-desktop-host.cmd` 后，**以后覆盖升级或换文件夹都不需要重新注册**。如果 `edge://extensions/` 显示的 ID 与提示不一致，也可在扩展目录运行 `register-desktop-host.cmd <扩展 ID>`（脚本会同时登记文件夹 ID 和固定 ID）。
+本扩展从 v4.0.4 起使用固定扩展 ID，桌面保存组件也放在用户目录（`%LOCALAPPDATA%\ScienceDirectEdge`）。首次安装运行一次 `register-desktop-host.cmd` 后，**以后覆盖升级或换文件夹都不需要重新注册**。如果 `edge://extensions/` 显示的 ID 与提示不一致，也可在扩展目录运行 `register-desktop-host.cmd <扩展 ID>`（脚本会同时登记文件夹 ID 和固定 ID）。
 
-已安装旧版时，把新版文件覆盖到原扩展目录，再到 `edge://extensions/` 点 **重新加载** 即可（首次升级到 v4.0.3 时运行一次 `register-desktop-host.cmd`）。扩展更新后仍留在旧论文页上的脚本会自动刷新并继续下载，论文页不会被关闭。
+已安装旧版时，把新版文件覆盖到原扩展目录，再到 `edge://extensions/` 点 **重新加载** 即可（首次升级到 v4.0.4 时运行一次 `register-desktop-host.cmd`）。扩展更新后仍留在旧论文页上的脚本会自动刷新并继续下载，论文页不会被关闭。
 
 GitHub Releases 的 `latest` 只提供**最新版本**安装包；历史版本的更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -45,10 +45,11 @@ GitHub Releases 的 `latest` 只提供**最新版本**安装包；历史版本�
 
 下载过程中遇到 ScienceDirect 的 Cloudflare 人机验证时，扩展会自动检测验证页面、模拟点击验证框，必要时刷新页面重试。验证通过后自动继续当前下载，扩展弹窗可以关闭。
 
+- **防误触**：自动点击只落在 Turnstile 左侧复选框的安全区域（最多 3 次、间隔约 2 秒），不会点击右下角的 Cloudflare 品牌链接；万一仍误跳到 Cloudflare 产品页，扩展会自动返回论文页继续下载，意外新开的品牌页会自动关闭。
 - 自动处理失败时，扩展会暂停并提示手动完成验证。在打开的页面完成验证后，下载会按原有流程继续，也可以回到扩展点 **继续下载**。
-- 即使挑战页仍在加载中也能检测并处理；自动处理失败会自动刷新页面重试（最多 8 次），仍失败才暂停等待手动完成。
-- 如果从旧版覆盖升级到 v4.0.3，原有下载与桌面保存功能保持不变；首次升级后运行一次扩展目录里的 `register-desktop-host.cmd` 即可，以后升级无需重复注册。
+- 即使挑战页仍在加载中也能检测并处理；自动处理失败会自动刷新页面重试（最多 3 次），仍失败才暂停等待手动完成。
+- 如果从旧版覆盖升级到 v4.0.4，原有下载与桌面保存功能保持不变；首次升级后运行一次扩展目录里的 `register-desktop-host.cmd` 即可，以后升级无需重复注册。
 - 自动验证与自动点击默认开启，无需设置（按你的要求已精简界面，不再显示设置区块）。
-- 本功能使用 Edge 扩展的「调试」权限模拟鼠标点击。安装或更新扩展后，Edge 重新加载扩展时若提示新增权限，请确认允许；自动验证期间可能出现短暂的「正在调试此浏览器」提示条，属正常现象，验证结束后自动消失。
+- 本功能使用 Edge 扩展的「调试」权限模拟鼠标点击，「读取标签页」权限仅用于发现误触跳转并自动返回；安装或更新扩展后，Edge 重新加载扩展时若提示新增权限，请确认允许；自动验证期间可能出现短暂的「正在调试此浏览器」提示条，属正常现象，验证结束后自动消失。
 - 仅对 ScienceDirect 相关页面和本扩展发起的下载任务生效，不会在其他网站运行，也不提供任何对外接口。
 - 不需要 Java 或 JDK，不需要安装 Cloudflare-Faker 服务端或独立浏览器插件，无数据上报。来源与致谢见 [NOTICE](NOTICE)。

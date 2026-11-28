@@ -708,6 +708,57 @@ function canonicalArticle(pii) {
   return `${publisher}/science/article/pii/${pii}`;
 }
 
+// The Turnstile widget contains a Cloudflare branding link at its bottom-right
+// corner. Automatic clicking must never open that marketing page; if a click
+// still lands on it (e.g. the widget moved between measurement and click), go
+// back to the paper page and continue the download automatically.
+function isTurnstileProductUrl(value) {
+  try {
+    const url = new URL(value);
+    if (!/(^|\.)cloudflare\.com$/i.test(url.hostname)) return false;
+    return /^\/products\/turnstile(?:\/|$)/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function recoverFromTurnstileLink(tabId) {
+  const job = await readJob();
+  if (!job) return;
+  if (job.tabId !== tabId && job.readerTabId !== tabId) return;
+  if (!['working', 'attention'].includes(job.status)) return;
+  // Stop the clicking session so it cannot navigate again.
+  try { fakerEngine()?.stop(tabId); } catch { /* ignore */ }
+  if (job.readerTabId === tabId) {
+    // The short-lived PDF tab was the one mis-clicked: close it and let the
+    // existing retry/watch logic continue from the paper page.
+    await chrome.tabs.remove(tabId).catch(() => {});
+    return updateJob({...job, faker: null, readerTabId: null}, {
+      message: job.awaitingBrowserDownload
+        ? '误触 Cloudflare 品牌链接，正在等待 Edge 下载并校验 PDF…'
+        : job.message,
+    });
+  }
+  const target = job.targetUrl || (job.pii ? canonicalArticle(job.pii) : '');
+  if (!target) {
+    await pause(job, '误触了 Cloudflare 品牌链接。请回到论文页后点「继续下载」。');
+    return;
+  }
+  const next = await updateJob({...job, faker: null}, {
+    status: 'working', phase: 'page', canRetry: true,
+    message: '误触 Cloudflare 品牌链接，已自动返回论文页，继续下载…',
+  });
+  await chrome.tabs.update(tabId, {url: target, active: true}).catch(() => {});
+  run(next);
+}
+
+async function closeAccidentalTurnstileTab(tabId) {
+  const job = await readJob();
+  if (!job || !job.faker || job.status !== 'working') return;
+  await chrome.tabs.remove(tabId).catch(() => {});
+  if (Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
+}
+
 async function withArticleTab(job, useArticle) {
   const articleTab = await chrome.tabs.create({active: false, url: canonicalArticle(job.pii)}).catch(() => null);
   if (!articleTab) return null;
@@ -1500,9 +1551,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changes) => {
+  if (changes.url && isTurnstileProductUrl(changes.url)) void enqueueAction(() => recoverFromTurnstileLink(tabId));
   if (fakerEngine()) void SDFakerBackground.onTabUpdated(tabId, changes);
   if (changes.url) void enqueueAction(() => detectReaderViewerFailure(tabId, changes.url));
   if (changes.status === 'complete') void enqueueAction(() => checkVerifiedPage(tabId));
+});
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (isTurnstileProductUrl(tab.pendingUrl || tab.url || '')) {
+    void enqueueAction(() => closeAccidentalTurnstileTab(tab.id));
+  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
