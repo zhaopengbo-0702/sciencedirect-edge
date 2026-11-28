@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ScienceDirect 论文下载助手",
-  "version": "3.3.1",
+  "version": "3.4",
   "description": "按题名、DOI 或链接查找一篇 ScienceDirect 论文，并使用 Edge 中已有的访问权限下载正文 PDF。",
   "permissions": ["storage", "downloads", "alarms", "offscreen", "nativeMessaging", "declarativeNetRequestWithHostAccess", "debugger"],
   "host_permissions": [
