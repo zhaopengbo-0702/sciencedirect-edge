@@ -69,7 +69,7 @@ function pause(job, message, canRetry = true) {
 
 function fail(job, message) {
   if (job.blobUrl) void releasePdf(job.blobUrl);
-  if (Number.isInteger(job.readerTabId)) void closeReaderTab(job, {force: true});
+  if (Number.isInteger(job.readerTabId)) void closeReaderTab(job);
   stopFakerQuietly();
   return updateJob(job, {
     status: 'error', message, phase: null, blobUrl: null, faker: null,
@@ -454,19 +454,48 @@ function enableReaderDownload(tabId, url, pii, filename) {
   });
 }
 
-async function closeReaderTab(job, options = {}) {
+async function closeReaderTab(job) {
   if (!Number.isInteger(job?.readerTabId) || job.readerTabId === job.tabId) return;
   const tab = await chrome.tabs.get(job.readerTabId).catch(() => null);
   if (!tab) return;
   const url = tab.url || tab.pendingUrl || '';
-  const disposable = options.force === true || !url || url === 'about:blank' ||
-    /^(?:chrome-extension|edge):\/\//i.test(url);
+  // v3.1: only ever close extension-created blank/internal tabs. A paper page or
+  // PDF viewer is always kept.
+  const disposable = !url || url === 'about:blank' ||
+    /^(?:chrome-extension|edge):\/\//i.test(url) || /^chrome:\/\/(?:newtab|downloads)\b/i.test(url);
   if (!disposable) return;
   await chrome.tabs.remove(job.readerTabId).catch(() => {});
   if (Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
 }
 
+async function restorePaperTab(job) {
+  if (!job?.readerReusedPaperTab || !Number.isInteger(job.tabId)) return;
+  const tab = await chrome.tabs.get(job.tabId).catch(() => null);
+  if (!tab || (tab.pendingUrl && tab.pendingUrl !== tab.url)) return;
+  const currentUrl = tab.url || '';
+  const originalUrl = job.paperTabUrl || job.targetUrl || (job.pii ? canonicalArticle(job.pii) : '');
+  const original = parseUrl(originalUrl);
+  if (!original || !publisherHosts.has(original.hostname) ||
+      !articlePath.test(original.pathname) || paperPii(original) !== job.pii) return;
+  if (currentUrl === originalUrl) return;
+  // Restore only when the download replaced the article in the same tab
+  // (PDF viewer / about:blank); a page the user is reading is never touched.
+  const pdfShown = Boolean(officialPdf(currentUrl, job.pii));
+  const blank = !currentUrl || currentUrl === 'about:blank';
+  if (!pdfShown && !blank) return;
+  await chrome.tabs.update(job.tabId, {url: originalUrl}).catch(() => {});
+}
+
 async function awaitBrowserDownload(job, page) {
+  // v3.1: reuse the current paper tab instead of opening a new blank tab.
+  if (job.awaitingBrowserDownload && Number.isInteger(job.readerTabId)) {
+    const existing = await chrome.tabs.get(job.readerTabId).catch(() => null);
+    if (existing) {
+      if (!existing.active) await chrome.tabs.update(existing.id, {active: true}).catch(() => {});
+      return job;
+    }
+    job = {...job, readerTabId: null};
+  }
   const watchStartedAt = Date.now();
   if (page.kind === 'viewer' && page.pii === job.pii) {
     job = {...job, manualReader: true};
@@ -486,10 +515,18 @@ async function awaitBrowserDownload(job, page) {
   const url = officialPdf(page.pdfUrl, job.pii) || await resolvePdf(job);
   if (!url) return next;
 
-  // Register the download before navigating, so an inline PDF or immediate
-  // attachment can be saved from the publisher's normal document response.
-  const reader = await chrome.tabs.create({url: 'about:blank', openerTabId: job.tabId, active: false}).catch(() => null);
+  const paperTab = Number.isInteger(job.tabId) ? await chrome.tabs.get(job.tabId).catch(() => null) : null;
+  const reusePaperTab = Boolean(paperTab);
+  const reader = reusePaperTab
+    ? paperTab
+    : await chrome.tabs.create({url: 'about:blank', openerTabId: job.tabId, active: false}).catch(() => null);
   if (!reader) return next;
+  const original = parseUrl(job.targetUrl || '');
+  const paperTabUrl = reusePaperTab
+    ? (original && publisherHosts.has(original.hostname) && articlePath.test(original.pathname)
+      ? job.targetUrl
+      : canonicalArticle(job.pii))
+    : null;
   let automatic = true;
   try {
     const filename = await pdfFilename(job);
@@ -500,6 +537,8 @@ async function awaitBrowserDownload(job, page) {
   }
   const pending = await updateJob(next, {
     readerTabId: reader.id,
+    readerReusedPaperTab: reusePaperTab,
+    paperTabUrl,
     message: automatic
       ? '已打开 ScienceDirect 的官方 PDF 链接，正在等待 Edge 下载并校验 PDF。'
       : '已打开 ScienceDirect 的官方 PDF 链接。若进入 Edge 阅读器，请点右上角「保存」。',
@@ -509,8 +548,12 @@ async function awaitBrowserDownload(job, page) {
     return pending;
   } catch {
     await clearReaderDownloadRule();
-    await chrome.tabs.remove(reader.id).catch(() => {});
-    return updateJob(next, {readerTabId: null});
+    if (reusePaperTab) {
+      await restorePaperTab({...pending, readerReusedPaperTab: true});
+    } else {
+      await closeReaderTab(pending);
+    }
+    return updateJob(next, {readerTabId: null, readerReusedPaperTab: false});
   }
 }
 
