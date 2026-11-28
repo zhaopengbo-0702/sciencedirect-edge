@@ -282,6 +282,21 @@
         type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1, modifiers: 0,
       });
 
+      // Keyboard fallback: a focused Turnstile checkbox can also be toggled
+      // with Space. Some widget variants ignore synthetic mouse clicks.
+      try {
+        await wait(randomBetween(30, 70));
+        await chrome.debugger.sendCommand({tabId: session.tabId}, 'Input.dispatchKeyEvent', {
+          type: 'keyDown', key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
+        });
+        await wait(randomBetween(30, 80));
+        await chrome.debugger.sendCommand({tabId: session.tabId}, 'Input.dispatchKeyEvent', {
+          type: 'keyUp', key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
+        });
+      } catch {
+        // The keyboard fallback is optional.
+      }
+
       session.mouse = to;
       session.clicks += 1;
       session.lastClickAt = Date.now();
@@ -329,12 +344,6 @@
       await finish(session, stalledReason === 'no_widget' ? 'no_widget' : 'exhausted');
       return;
     }
-    // v3.3: give Cloudflare time to finish processing the last click before
-    // refreshing the page. Refreshing immediately was the main cause of
-    // "the page reloads before the click result comes back".
-    const sinceClick = Number.isFinite(session.lastClickAt) ? Date.now() - session.lastClickAt : Infinity;
-    if (sinceClick < 4000) await wait(4000 - sinceClick);
-    await wait(1000);
     session.reloads += 1;
     session.phase = 'reloading';
     session.challengeSeen = session.challengeSeen || stalledReason === 'no_widget';

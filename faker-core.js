@@ -11,15 +11,14 @@
   const FAKER_HOSTS = SCIENCE_DIRECT_HOSTS.concat(PDF_HOSTS);
   const DEFAULT_SETTINGS = Object.freeze({enabled: true, autoClick: true});
   const LIMITS = Object.freeze({
-    // v3.3: click few times with a slower cadence so a real click cannot hit
-    // the Turnstile branding link and does not disturb the challenge.
-    maxClicks: 3,
-    // Fewer page reloads: reloading too fast is a common cause of failed checks.
-    maxReloads: 3,
-    // v3.3 timing: wait ~3.5s between clicks and leave Cloudflare several
-    // seconds to process each click before deciding to click again/reload.
-    clickIntervalMs: 2000,
-    armDelayMs: 600,
+    maxClicks: 5,
+    // The user asked for "keep refreshing and retrying if it does not work":
+    // eight refresh attempts per verification session, up to four minutes.
+    maxReloads: 8,
+    // Latency tuning (v2.4): click soon after the widget appears and poll the
+    // challenge state more often so a solved challenge is noticed quickly.
+    clickIntervalMs: 1200,
+    armDelayMs: 400,
     sessionTimeoutMs: 240000,
     stateIntervalMs: 500,
   });
@@ -399,40 +398,51 @@
     const frame = normalizeRect(frameRect);
     const box = normalizeRect(captchaBoxRect);
     const candidates = [];
-    const avoidBrandingLink = (x, rect) => {
-      // The Cloudflare/Turnstile branding link sits at the bottom-right of the
-      // widget. Never return a point near it.
-      const right = rect.x + rect.width - 110;
-      return x <= right;
-    };
 
     if (frame) {
       const {x, y, width, height} = frame;
-      // The interactive checkbox is always at the left edge; clicking anywhere
-      // else may hit the widget label or the Cloudflare branding link.
-      const boxCenterY = Math.min(34, Math.max(24, Math.round(height / 2)));
-      const offsets = [[28, boxCenterY], [24, boxCenterY - 2], [32, boxCenterY + 2], [30, boxCenterY], [26, boxCenterY + 1]];
-      for (const [dx, dy] of offsets) {
-        if (avoidBrandingLink(x + dx, frame)) candidates.push(toPoint(x + dx, y + dy));
+      if (width >= 200) {
+        // Wide widget: the checkbox sits near the left edge, but some layouts
+        // only react to clicks on the label text. Cover both areas.
+        const offsets = [[30, 33], [26, 30], [34, 36], [40, 32], [120, 33], [180, 33], [60, 33]];
+        for (const [dx, dy] of offsets) candidates.push(toPoint(x + dx, y + dy));
+        candidates.push(toPoint(x + width / 2, y + height / 2));
+      } else {
+        // Compact widget: aim at the left-hand checkbox area proportionally.
+        const ratios = [[0.12, 0.5], [0.1, 0.45], [0.15, 0.55], [0.13, 0.48]];
+        for (const [rx, ry] of ratios) candidates.push(toPoint(x + width * rx, y + height * ry));
+        candidates.push(toPoint(x + width / 2, y + height / 2));
+        candidates.push(toPoint(x + width / 2, y + height * 0.35));
       }
     }
 
     if (box) {
-      const boxCenterY = Math.min(34, Math.max(24, Math.round(box.height / 2)));
-      const offsets = [[28, boxCenterY], [30, boxCenterY], [26, boxCenterY + 2]];
-      for (const [dx, dy] of offsets) {
-        if (avoidBrandingLink(box.x + dx, box)) candidates.push(toPoint(box.x + dx, box.y + dy));
-      }
+      const cx = box.x + box.width / 2;
+      const cy = box.y + box.height / 2;
+      const leftShift = Math.min(Math.round(box.width * 0.25), 120);
+      const upShift = Math.min(Math.round(box.height * 0.25), 80);
+      // The real Turnstile checkbox sits in the upper-left of the widget; when
+      // the iframe is unavailable (shadow DOM / not injected yet) aim there
+      // first, then fall back to the container centre.
+      const bandTop = box.y + Math.min(Math.round(box.height * 0.5), 33);
+      for (const dx of [24, 34, 44]) candidates.push(toPoint(box.x + dx, bandTop));
+      candidates.push(toPoint(cx, cy));
+      candidates.push(toPoint(cx - leftShift, cy));
+      candidates.push(toPoint(cx, cy - upShift));
+      candidates.push(toPoint(box.x + 34, box.y + 33));
+      candidates.push(toPoint(cx - leftShift, cy - upShift));
     }
 
-    // De-duplicate while keeping order.
     const seen = new Set();
-    return candidates.filter((point) => {
+    const points = [];
+    for (const point of candidates) {
       const key = `${point.x},${point.y}`;
-      if (seen.has(key)) return false;
+      if (seen.has(key)) continue;
       seen.add(key);
-      return true;
-    });
+      points.push(point);
+      if (points.length >= 8) break;
+    }
+    return points;
   }
 
   function pointOf(value) {
