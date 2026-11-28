@@ -60,7 +60,7 @@ jobs:
             $packageFiles = @(
               'manifest.json', 'background.js', 'page.js', 'offscreen.html', 'offscreen.js',
               'popup.html', 'popup.css', 'popup.js', 'icons',
-              'faker-core.js', 'faker-content.js', 'faker-background.js', 'panel.js', 'NOTICE',
+              'panel.js',
               'register-desktop-host.ps1', 'register-desktop-host.cmd', 'README.md', 'CHANGELOG.md'
             )
             Copy-Item -LiteralPath $packageFiles -Destination $bundle -Recurse

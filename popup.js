@@ -31,7 +31,6 @@ function render(nextState) {
   if (ui.status.textContent !== message) ui.status.textContent = message;
 
   ui.focus.hidden = !['attention', 'error', 'choose'].includes(state.status) || !Number.isInteger(state.tabId);
-  ui.focus.textContent = Number.isInteger(state.readerTabId) ? '打开 PDF 标签页' : '打开论文标签页';
   ui.retry.hidden = state.status !== 'attention' || !Number.isInteger(state.tabId) || state.canRetry === false;
   ui.show.hidden = state.status !== 'complete' || !state.filename;
   ui.actions.hidden = ui.focus.hidden && ui.retry.hidden && ui.show.hidden;
