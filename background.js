@@ -25,6 +25,11 @@ const stateKey = 'downloadJob';
 const watchdog = 'scienceDirectDownload';
 const browserWatchdog = 'scienceDirectBrowserDownload';
 const browserDownloadWindow = 15 * 60 * 1000;
+// When the extension is updated while a paper page stays open, that page keeps
+// the previous content script and cannot start the in-page download. Reload the
+// same page (it stays open) and retry, at most this many times.
+const pageDownloadReloadLimit = 2;
+const manualPageDownloadMessage = '请在论文页点「View PDF」，再点 Edge 阅读器右上角的下载按钮，扩展会校验并保存到桌面。';
 const pageDownloadRuleIds = [1, 2, 3];
 const desktopHost = 'org.sciencedirect_desktop.save';
 const publisher = 'https://www.sciencedirect.com';
@@ -243,7 +248,7 @@ async function resumeJob(job, retryNavigation, resumedAfterVerification = false,
   await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
   const next = await updateJob(job, {
     status: 'working', phase: 'page', message: loadingMessage, downloadId: null, retryNavigation,
-    gateWatchId: null, pdfAttempt: 0, pdfFailure: null, pageWaits: 0,
+    gateWatchId: null, pdfAttempt: 0, pdfFailure: null, pageWaits: 0, pageDownloadReloads: 0,
     resumedAfterVerification, faker: null,
     pausedFromPhase: null, autoRecoverNotice: false, autoRecoverExhausted: false,
     autoRecoverCount: resetAutoRecover ? 0 : autoRecoverCount,
@@ -476,6 +481,15 @@ function stopPageDownload(tabId) {
   return chrome.tabs.sendMessage(tabId, {type: 'sd:stop-page-download'}, {frameId: 0}).catch(() => {});
 }
 
+// True when the paper page runs the current content script. Pages opened before
+// an extension update keep the old script, which does not understand the
+// in-page download message; those pages need one reload.
+async function pageDownloadSupported(tabId) {
+  if (!Number.isInteger(tabId)) return false;
+  const response = await chrome.tabs.sendMessage(tabId, {type: 'sd:page-download-ping'}, {frameId: 0}).catch(() => null);
+  return Boolean(response?.supported);
+}
+
 async function awaitBrowserDownload(job, page) {
   const watchStartedAt = Date.now();
   if (page.kind === 'viewer' && page.pii === job.pii) {
@@ -501,32 +515,60 @@ async function awaitBrowserDownload(job, page) {
   // turns that response into a normal Edge download. This replaces the old
   // blank tab, so the paper page is never replaced or closed.
   let configured = false;
+  let hostUnavailable = false;
   try {
     const filename = await pdfFilename(job);
     await enablePageDownload(job.tabId, url, job.pii, filename);
     configured = true;
   } catch (error) {
     console.warn('Could not configure automatic PDF attachment:', error.message);
+    // Only native-messaging failures mean the desktop helper is not registered;
+    // any other error keeps the generic manual fallback.
+    hostUnavailable = /native messaging host|native host|Failed to start native/i.test(error.message || '');
   }
   if (!configured) {
     await clearPageDownloadRule();
-    return updateJob(next, {
-      message: '请在论文页点「View PDF」，再点 Edge 阅读器右上角的下载按钮，扩展会校验并保存到桌面。',
-    });
+    if (hostUnavailable) {
+      return updateJob(next, {
+        canRetry: true,
+        message: '桌面保存组件未注册或不可用。请在本扩展目录运行一次 register-desktop-host.cmd，然后点「继续下载」。',
+      });
+    }
+    return updateJob(next, {message: manualPageDownloadMessage});
   }
   const pending = await updateJob(next, {
     message: '已从论文页请求 ScienceDirect 的官方 PDF 下载，正在等待 Edge 下载并校验 PDF。',
   });
-  const started = await chrome.tabs.sendMessage(job.tabId, {
+  const trigger = () => chrome.tabs.sendMessage(job.tabId, {
     type: 'sd:page-download', url, pii: job.pii,
   }, {frameId: 0}).catch(() => null);
-  if (!started?.ok) {
-    await clearPageDownloadRule();
-    return updateJob(next, {
-      message: '请在论文页点「View PDF」，再点 Edge 阅读器右上角的下载按钮，扩展会校验并保存到桌面。',
-    });
+  let started = await trigger();
+  if (started?.ok !== true) {
+    // A page that is still finishing its own render can reject the first try.
+    await waitFor(600);
+    started = await trigger();
   }
-  return pending;
+  if (started?.ok === true) return pending;
+
+  await clearPageDownloadRule();
+  const reloads = Number.isInteger(job.pageDownloadReloads) ? job.pageDownloadReloads : 0;
+  if (reloads < pageDownloadReloadLimit && !(await pageDownloadSupported(job.tabId))) {
+    // The paper tab still runs an older content script (the extension was
+    // updated while the page stayed open). Reload the same paper page so it
+    // keeps the page open but gets the current script, then continue the same
+    // download automatically.
+    await chrome.alarms.clear(browserWatchdog);
+    const reloading = await updateJob(next, {
+      status: 'working', phase: 'page', awaitingBrowserDownload: false, watchDeadline: null,
+      pageDownloadReloads: reloads + 1, manualReader: false, gateWatchId: null, downloadId: null,
+      message: '论文页上的扩展脚本版本较旧，正在自动刷新论文页后继续下载…',
+    });
+    await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
+    await chrome.tabs.reload(job.tabId, {bypassCache: true}).catch(() => {});
+    run(reloading);
+    return reloading;
+  }
+  return updateJob(next, {canRetry: true, message: manualPageDownloadMessage});
 }
 
 function matchesBrowserDownload(job, item) {
@@ -1238,7 +1280,7 @@ async function start(job, message) {
   }
   const fresh = {
     status: 'working', phase: 'page', message: loadingMessage,
-    autoRecoverCount: 0, autoDownloadRetryCount: 0,
+    autoRecoverCount: 0, autoDownloadRetryCount: 0, pageDownloadReloads: 0,
     autoRecoverNotice: false, autoRecoverExhausted: false, pausedFromPhase: null,
   };
   if (message.mode === 'current') {

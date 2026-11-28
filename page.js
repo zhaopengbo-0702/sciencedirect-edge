@@ -436,6 +436,8 @@
     } else if (message?.type === 'sd:fetch-page-pdf') {
       void fetchPagePdf(message).then(sendResponse);
       return true;
+    } else if (message?.type === 'sd:page-download-ping') {
+      sendResponse({supported: true});
     } else if (message?.type === 'sd:page-download') {
       sendResponse(startPageDownload(message));
     } else if (message?.type === 'sd:stop-page-download') {
