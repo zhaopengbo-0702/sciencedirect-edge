@@ -640,6 +640,42 @@ async function expireBrowserWatch() {
   });
 }
 
+function isTurnstileProductUrl(value) {
+  try {
+    const url = new URL(value);
+    if (!/(^|\.)cloudflare\.com$/i.test(url.hostname)) return false;
+    return /^\/products\/turnstile(?:\/|$)/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function recoverFromTurnstileLink(tabId) {
+  const job = await readJob();
+  if (!job || job.tabId !== tabId) return;
+  if (!['working', 'attention'].includes(job.status)) return;
+  // Stop the clicking session so it cannot navigate again.
+  try { fakerEngine()?.stop(tabId); } catch { /* ignore */ }
+  const target = job.targetUrl || (job.pii ? canonicalArticle(job.pii) : '');
+  if (!target) {
+    await pause(job, '误触了 Cloudflare 品牌链接。请回到论文页后点「继续下载」。');
+    return;
+  }
+  const next = await updateJob({...job, faker: null}, {
+    status: 'working', phase: 'page', canRetry: true,
+    message: '误触 Cloudflare 品牌链接，已自动返回论文页，继续下载…',
+  });
+  await chrome.tabs.update(tabId, {url: target, active: true}).catch(() => {});
+  run(next);
+}
+
+async function closeAccidentalTurnstileTab(tabId) {
+  const job = await readJob();
+  if (!job || !job.faker || job.status !== 'working') return;
+  await chrome.tabs.remove(tabId).catch(() => {});
+  if (Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
+}
+
 function canonicalArticle(pii) {
   return `${publisher}/science/article/pii/${pii}`;
 }
@@ -1414,9 +1450,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changes) => {
+  if (changes.url && isTurnstileProductUrl(changes.url)) void enqueueAction(() => recoverFromTurnstileLink(tabId));
   if (fakerEngine()) void SDFakerBackground.onTabUpdated(tabId, changes);
   if (changes.url) void enqueueAction(() => detectReaderViewerFailure(tabId, changes.url));
   if (changes.status === 'complete') void enqueueAction(() => checkVerifiedPage(tabId));
+});
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (isTurnstileProductUrl(tab.pendingUrl || tab.url || '')) {
+    void enqueueAction(() => closeAccidentalTurnstileTab(tab.id));
+  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
