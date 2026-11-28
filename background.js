@@ -1,5 +1,26 @@
 'use strict';
 
+// Cloudflare Faker modules. faker-core.js holds the shared, DOM-free helpers;
+// faker-background.js runs the verification sessions (chrome.debugger clicks).
+try {
+  importScripts('faker-core.js', 'faker-background.js');
+} catch (error) {
+  console.error('Cloudflare Faker modules failed to load; automatic verification is disabled.', error);
+}
+
+const fakerAlarmPrefix = 'sd-faker-';
+// Automatic recovery: when a download stops for a recoverable reason the job
+// retries itself instead of waiting for a manual click. Only active while the
+// Cloudflare Faker setting is enabled, so switching it off keeps v1.2.6
+// behaviour exactly.
+const autoRecoverAlarm = 'scienceDirectAutoRecover';
+const autoRecoverDelays = [15000, 30000, 60000, 120000];
+// Verification failures retry for much longer: Cloudflare challenges can take
+// a while to clear, and the user explicitly wants no manual intervention.
+// The first retries are extremely fast so a challenged tab recovers quickly.
+const autoVerificationDelays = [6000, 15000, 30000, 60000, 120000, 300000, 300000, 300000];
+const autoDownloadRetries = 3;
+const autoDownloadRetryDelay = 6000;
 const stateKey = 'downloadJob';
 const watchdog = 'scienceDirectDownload';
 const browserWatchdog = 'scienceDirectBrowserDownload';
@@ -128,20 +149,25 @@ async function updateJob(job, changes) {
     await releaseDownloadClaim(next);
   }
   await chrome.storage.session.set({[stateKey]: next});
+  if (next.status === 'attention') void scheduleAutoRecovery(next);
+  else void chrome.alarms.clear(autoRecoverAlarm).catch(() => {});
   return next;
 }
 
 function pause(job, message, canRetry = true) {
   if (job.blobUrl) void releasePdf(job.blobUrl);
   return updateJob(job, {
-    status: 'attention', message, canRetry, phase: null, blobUrl: null,
+    status: 'attention', message, canRetry, phase: null, blobUrl: null, faker: null,
+    pausedFromPhase: job.phase || null, autoRecoverNotice: false,
   });
 }
 
 function fail(job, message) {
   if (job.blobUrl) void releasePdf(job.blobUrl);
+  if (Number.isInteger(job.readerTabId)) void closeReaderTab(job, {force: true});
+  stopFakerQuietly();
   return updateJob(job, {
-    status: 'error', message, phase: null, blobUrl: null,
+    status: 'error', message, phase: null, blobUrl: null, faker: null,
     readerTabId: null, awaitingBrowserDownload: false,
   });
 }
@@ -293,7 +319,7 @@ async function injectPageScripts(tabId) {
     if (!url || !publisherHosts.has(url.hostname)) return false;
     await chrome.scripting.executeScript({
       target: {tabId},
-      files: ['page.js', 'panel.js'],
+      files: ['page.js', 'faker-core.js', 'faker-content.js', 'panel.js'],
     });
     injectedTabs.add(tabId);
     return true;
@@ -335,12 +361,16 @@ function matchesVerifiedPage(job, page) {
   return Boolean(job.doi && page.doi?.toLowerCase() === job.doi.toLowerCase());
 }
 
-async function resumeJob(job, retryNavigation, resumedAfterVerification = false) {
+async function resumeJob(job, retryNavigation, resumedAfterVerification = false,
+    resetAutoRecover = true, autoRecoverCount = 0) {
   await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
   const next = await updateJob(job, {
     status: 'working', phase: 'page', message: loadingMessage, downloadId: null, retryNavigation,
     gateWatchId: null, pdfAttempt: 0, pdfFailure: null, pageWaits: 0,
-    resumedAfterVerification,
+    resumedAfterVerification, faker: null,
+    pausedFromPhase: null, autoRecoverNotice: false, autoRecoverExhausted: false,
+    autoRecoverCount: resetAutoRecover ? 0 : autoRecoverCount,
+    autoDownloadRetryCount: resetAutoRecover ? 0 : (Number.isInteger(job.autoDownloadRetryCount) ? job.autoDownloadRetryCount : 0),
   });
   if (job.gateWatchId) void gateWatchMessage(job, 'sd:stop-watch-gate');
   run(next);
@@ -539,7 +569,9 @@ async function finishDesktopSave(job) {
     }
   }
   if (job.browserDownload) await chrome.alarms.clear(browserWatchdog);
+  await closeReaderTab(job, {force: true});
   await restorePaperTab(job);
+  stopFakerQuietly();
   return updateJob(job, {
     status: 'complete', phase: null, stagedFile: null, readerTabId: null,
     readerReusedPaperTab: false, paperTabUrl: null, awaitingBrowserDownload: false, browserDownload: false,
@@ -578,19 +610,35 @@ function enableReaderDownload(tabId, url, pii, filename) {
   });
 }
 
+async function closeReaderTab(job, options = {}) {
+  if (!Number.isInteger(job?.readerTabId) || job.readerTabId === job.tabId) return;
+  const tab = await chrome.tabs.get(job.readerTabId).catch(() => null);
+  if (!tab) return;
+  const url = tab.url || tab.pendingUrl || '';
+  // v2.7: only ever close tabs that are still blank or extension-internal.
+  // A paper page, PDF viewer or search page is never removed after download.
+  const disposable = !url || url === 'about:blank' ||
+    /^(?:chrome-extension|edge):\/\//i.test(url) || /^chrome:\/\/(?:newtab|downloads)\b/i.test(url);
+  if (!disposable) return;
+  await chrome.tabs.remove(job.readerTabId).catch(() => {});
+  if (Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
+}
+
 async function restorePaperTab(job) {
-  if (!job.readerReusedPaperTab || !Number.isInteger(job.tabId)) return;
+  if (!job?.readerReusedPaperTab || !Number.isInteger(job.tabId)) return;
   const tab = await chrome.tabs.get(job.tabId).catch(() => null);
   if (!tab || (tab.pendingUrl && tab.pendingUrl !== tab.url)) return;
-
   const currentUrl = tab.url || '';
   const originalUrl = job.paperTabUrl || job.targetUrl || (job.pii ? canonicalArticle(job.pii) : '');
-  const originalArticle = parseUrl(originalUrl);
-  if (!originalArticle || !publisherHosts.has(originalArticle.hostname) ||
-      !articlePath.test(originalArticle.pathname) || paperPii(originalArticle) !== job.pii) return;
-
-  // Restore only when the download replaced the article in the same tab.
-  if (currentUrl === originalUrl || (currentUrl && currentUrl !== 'about:blank' && !officialPdf(currentUrl, job.pii))) return;
+  const original = parseUrl(originalUrl);
+  if (!original || !publisherHosts.has(original.hostname) ||
+      !articlePath.test(original.pathname) || paperPii(original) !== job.pii) return;
+  if (currentUrl === originalUrl) return;
+  // Restore only when the download replaced the article in the same tab
+  // (PDF viewer / about:blank); a page the user is reading is never touched.
+  const pdfShown = Boolean(officialPdf(currentUrl, job.pii));
+  const blank = !currentUrl || currentUrl === 'about:blank';
+  if (!pdfShown && !blank) return;
   await chrome.tabs.update(job.tabId, {url: originalUrl}).catch(() => {});
 }
 
@@ -628,15 +676,21 @@ async function awaitBrowserDownload(job, page) {
       : 'ScienceDirect 拦截了扩展的 PDF 请求。请在论文页点「View PDF」，再点 Edge 阅读器右上角的下载按钮，扩展会校验并保存到桌面。',
   });
   await chrome.alarms.create(browserWatchdog, {when: next.watchDeadline});
+  void scheduleDownloadRetry(next);
 
   if (page.kind !== 'article' || page.pii !== job.pii) return next;
   const url = officialPdf(page.pdfUrl, job.pii) || await resolvePdf(job);
   if (!url) return next;
 
-  const reader = Number.isInteger(job.tabId) ? await chrome.tabs.get(job.tabId).catch(() => null) : null;
-  const article = parseUrl(reader?.url);
-  if (!article || !publisherHosts.has(article.hostname) || !articlePath.test(article.pathname) ||
-      paperPii(article) !== job.pii || (reader.pendingUrl && reader.pendingUrl !== reader.url)) return next;
+  // v2.6: prefer downloading through the current paper tab instead of opening
+  // a new blank tab. The DNR rule turns the PDF response into an attachment,
+  // so Edge starts the download while the tab is restored afterwards.
+  const paperTab = Number.isInteger(job.tabId) ? await chrome.tabs.get(job.tabId).catch(() => null) : null;
+  const reusePaperTab = Boolean(paperTab);
+  const reader = reusePaperTab
+    ? paperTab
+    : await chrome.tabs.create({url: 'about:blank', openerTabId: job.tabId, active: false}).catch(() => null);
+  if (!reader) return next;
   let automatic = true;
   try {
     const filename = await pdfFilename(job);
@@ -647,18 +701,24 @@ async function awaitBrowserDownload(job, page) {
   }
   const pending = await updateJob(next, {
     readerTabId: reader.id,
-    readerReusedPaperTab: true, paperTabUrl: reader.url,
+    readerReusedPaperTab: reusePaperTab,
+    paperTabUrl: reusePaperTab ? (paperTab.url || job.targetUrl || '') : null,
     message: automatic
       ? '已打开 ScienceDirect 的官方 PDF 链接，正在等待 Edge 下载并校验 PDF。'
       : '已打开 ScienceDirect 的官方 PDF 链接。若进入 Edge 阅读器，请点右上角「保存」。',
   });
   try {
-    await chrome.tabs.update(reader.id, {url});
+    await chrome.tabs.update(reader.id, {url, active: true});
     return pending;
   } catch {
     await clearReaderDownloadRule();
-    await restorePaperTab(pending);
-    return updateJob(next, {readerTabId: null, readerReusedPaperTab: false, paperTabUrl: null});
+    if (reusePaperTab) {
+      // Never close the user's paper tab; put it back on the article page.
+      await restorePaperTab({...next, readerReusedPaperTab: true});
+    } else {
+      await closeReaderTab({...next, readerTabId: reader.id});
+    }
+    return updateJob(next, {readerTabId: null, readerReusedPaperTab: false});
   }
 }
 
@@ -691,7 +751,9 @@ async function captureBrowserDownload(id) {
 
   await clearReaderDownloadRule();
   await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
+  await closeReaderTab(job, {force: true});
   await restorePaperTab(job);
+  stopFakerQuietly();
   const next = await updateJob(job, {
     status: 'working', phase: 'desktop', awaitingBrowserDownload: false, browserDownload: true,
     downloadId: id, stagedFile: item.filename, manualDownloadIds: [...job.manualDownloadIds, id],
@@ -705,6 +767,7 @@ async function expireBrowserWatch() {
   const job = await readJob();
   if (job.status !== 'attention' || job.phase !== 'manual-download' || Date.now() < job.watchDeadline) return;
   await clearReaderDownloadRule();
+  await closeReaderTab(job, {force: true});
   await restorePaperTab(job);
   return updateJob(job, {
     phase: null, awaitingBrowserDownload: false, canRetry: false, readerTabId: null,
@@ -806,7 +869,13 @@ async function refetchFromArticle(job) {
 async function showPdfFailure(job, reason) {
   if (['challenge', 'pdf_blocked', 'access'].includes(reason)) {
     const page = await readPage(job);
-    if (['challenge', 'access'].includes(page.kind)) return pauseAtGate(job, page);
+    if (['challenge', 'access'].includes(page.kind)) {
+      if (page.kind === 'challenge') {
+        const started = await startFakerForJob('gate');
+        if (started) return started;
+      }
+      return pauseAtGate(job, page);
+    }
     if (reason !== 'access') return enqueueAction(() => awaitBrowserDownload(job, page));
     return pause(job, 'ScienceDirect 拒绝了全文 PDF 请求。请在论文详情页检查机构登录和全文权限，再点「继续下载」。');
   }
@@ -879,6 +948,419 @@ async function downloadPaper(job, page) {
   return verifyWithRecovery(next, page);
 }
 
+// --- Cloudflare Faker integration -----------------------------------------
+// All automatic-verification work is scoped to this extension's own download
+// job and to ScienceDirect hosts. With the feature disabled (or the modules
+// unavailable) every code path below falls back to the pre-Faker behaviour.
+
+function fakerEngine() {
+  return globalThis.SDFakerBackground || null;
+}
+
+function fakerSettings() {
+  const engine = fakerEngine();
+  if (!engine) return {enabled: false, autoClick: false};
+  try {
+    return engine.getSettings();
+  } catch {
+    return {enabled: false, autoClick: false};
+  }
+}
+
+function fakerLimits() {
+  return globalThis.SDFakerCore?.LIMITS || {maxClicks: 6, maxReloads: 3};
+}
+
+function fakerProgressMessage(session) {
+  const limits = fakerLimits();
+  if (session?.phase === 'reloading') {
+    return `自动验证未通过，正在刷新页面重试（${session.reloads}/${limits.maxReloads}）…`;
+  }
+  if (session?.clicks) {
+    return `正在自动通过 Cloudflare 人机验证（点击 ${session.clicks}/${limits.maxClicks}）…`;
+  }
+  return '检测到 Cloudflare 人机验证，正在自动通过…';
+}
+
+function stopFakerQuietly() {
+  try {
+    fakerEngine()?.stopAll();
+  } catch {
+    // Automatic verification is optional; never block the download flow.
+  }
+}
+
+// --- Automatic retry / self-recovery for failed downloads -----------------
+// When the Faker setting is on, recoverable failures retry themselves
+// (re-open the tab, re-run the download pipeline or re-open the PDF link)
+// instead of stopping until the user clicks "继续下载" manually.
+
+function fakerAutoEnabled() {
+  try {
+    return Boolean(fakerSettings().enabled);
+  } catch {
+    return false;
+  }
+}
+
+async function clearAutoRecovery() {
+  try {
+    await chrome.alarms.clear(autoRecoverAlarm);
+  } catch {
+    // Ignore.
+  }
+}
+
+function isVerificationFailure(job) {
+  if (!job) return false;
+  if (!['page', 'download'].includes(job.pausedFromPhase)) return false;
+  return /验证|人机|Cloudflare|verif/i.test(job.message || '');
+}
+
+function autoRecoverDelayList(job) {
+  return isVerificationFailure(job) ? autoVerificationDelays : autoRecoverDelays;
+}
+
+async function scheduleAutoRecovery(job) {
+  try {
+    if (!job || job.status !== 'attention') {
+      await clearAutoRecovery();
+      return;
+    }
+    if (job.awaitingBrowserDownload) return; // download waits are handled by scheduleDownloadRetry
+    if (job.canRetry === false || !fakerAutoEnabled() || job.autoRecoverExhausted) {
+      await clearAutoRecovery();
+      return;
+    }
+    const delays = autoRecoverDelayList(job);
+    const count = Number.isInteger(job.autoRecoverCount) ? job.autoRecoverCount : 0;
+    if (count >= delays.length) {
+      await clearAutoRecovery();
+      if (!job.autoRecoverExhausted) {
+        const exhausted = isVerificationFailure(job)
+          ? '自动验证已多次自动重试仍未通过，请手动完成验证后点「继续下载」。'
+          : '自动重试已结束，可点「继续下载」手动重试。';
+        await chrome.storage.session.set({[stateKey]: {
+          ...job, autoRecoverExhausted: true,
+          message: `${job.message || '下载未完成'}（${exhausted}）`,
+        }});
+      }
+      return;
+    }
+    const delay = delays[count];
+    await clearAutoRecovery();
+    await chrome.alarms.create(autoRecoverAlarm, {when: Date.now() + delay});
+    if (!job.autoRecoverNotice) {
+      const seconds = Math.max(1, Math.round(delay / 1000));
+      await chrome.storage.session.set({[stateKey]: {
+        ...job, autoRecoverNotice: true,
+        message: `${job.message || '下载未完成'}（${seconds} 秒后自动重试）`,
+      }});
+    }
+  } catch {
+    // Auto recovery must never break the download flow.
+  }
+}
+
+async function scheduleDownloadRetry(job) {
+  try {
+    if (!fakerAutoEnabled()) return;
+    const attempts = Number.isInteger(job.autoDownloadRetryCount) ? job.autoDownloadRetryCount : 0;
+    if (attempts >= autoDownloadRetries) return;
+    await clearAutoRecovery();
+    await chrome.alarms.create(autoRecoverAlarm, {when: Date.now() + autoDownloadRetryDelay});
+  } catch {
+    // Ignore.
+  }
+}
+
+async function runAutoRecovery() {
+  const job = await readJob();
+  if (!job || job.status !== 'attention' || !fakerAutoEnabled()) return;
+  if (job.awaitingBrowserDownload) return retryManualDownload(job);
+  if (job.canRetry === false || job.autoRecoverExhausted) return;
+  const delays = autoRecoverDelayList(job);
+  const count = Number.isInteger(job.autoRecoverCount) ? job.autoRecoverCount : 0;
+  if (count >= delays.length) return;
+  const attempt = count + 1;
+  const label = `下载未完成，正在自动重试（第 ${attempt}/${delays.length} 次）…`;
+  const phase = job.pausedFromPhase || job.phase;
+  if (phase === 'manual-download') return retryManualDownload(job);
+  await clearAutoRecovery();
+
+  const tab = Number.isInteger(job.tabId) ? await chrome.tabs.get(job.tabId).catch(() => null) : null;
+  if (!tab && job.targetUrl) {
+    // The paper tab was closed: open it again and continue the same job.
+    const created = await chrome.tabs.create({url: job.targetUrl, active: true}).catch(() => null);
+    if (!created) {
+      return updateJob(job, {
+        canRetry: true, autoRecoverExhausted: true,
+        message: '下载失败，且无法自动重新打开论文页。请手动重试。',
+      });
+    }
+    const next = await updateJob(
+      {...job, tabId: created.id, gateWatchId: null, downloadId: null, blobUrl: null},
+      {status: 'working', phase: 'page', message: label, autoRecoverCount: attempt, autoRecoverNotice: false},
+    );
+    run(next);
+    return;
+  }
+  if (!phase || phase === 'page') {
+    return resumeJob(job, Boolean(job.targetUrl), false, false, attempt);
+  }
+  await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
+  const targetPhase = ['download', 'transfer', 'desktop', 'cleanup'].includes(phase) ? phase : 'page';
+  const next = await updateJob(job, {
+    status: 'working', phase: targetPhase, message: label,
+    autoRecoverCount: attempt, autoRecoverNotice: false,
+  });
+  run(next);
+}
+
+async function retryManualDownload(job) {
+  try {
+    const attempts = (Number.isInteger(job.autoDownloadRetryCount) ? job.autoDownloadRetryCount : 0) + 1;
+    await clearAutoRecovery();
+    await chrome.alarms.clear(browserWatchdog);
+    if (attempts > autoDownloadRetries) {
+      return updateJob(job, {
+        canRetry: true, autoRecoverExhausted: true,
+        message: '自动重试多次仍未触发 Edge 下载。请在论文页点「View PDF」，再点阅读器右上角下载按钮；或点「继续下载」重试保存。',
+      });
+    }
+    if (Number.isInteger(job.readerTabId)) await closeReaderTab({...job, tabId: job.readerTabId});
+    await clearReaderDownloadRule();
+    const next = await updateJob(job, {
+      status: 'working', phase: 'page', readerTabId: null, awaitingBrowserDownload: false,
+      manualReader: false, autoDownloadRetryCount: attempts, autoRecoverNotice: false,
+      message: `正在自动重试 PDF 下载（第 ${attempts}/${autoDownloadRetries} 次）…`,
+    });
+    run(next);
+    return next;
+  } catch {
+    return updateJob(job, {
+      canRetry: true,
+      message: '自动重试 PDF 下载失败。请在论文页重新点「View PDF」下载，或点「继续下载」。',
+    });
+  }
+}
+
+// The reader tab falling back to Edge's PDF viewer (or a viewer error page)
+// means the attachment download did not start; recover automatically instead
+// of leaving the "未能加载 PDF 文档" dialog for the user to handle.
+async function detectReaderViewerFailure(tabId, url) {
+  try {
+    if (!/^(?:chrome-extension:\/\/|edge:\/\/pdf)/i.test(url || '')) return;
+    const job = await readJob();
+    if (job.status !== 'attention' || job.phase !== 'manual-download' ||
+        job.awaitingBrowserDownload !== true || job.readerTabId !== tabId) return;
+    // Give a real attachment download a moment to be captured first.
+    await waitFor(1500);
+    const latest = await readJob();
+    if (latest.status !== 'attention' || latest.phase !== 'manual-download' ||
+        latest.awaitingBrowserDownload !== true || latest.downloadId) return;
+    await retryManualDownload(latest);
+  } catch {
+    // Recovery is best effort; the manual fallback stays available.
+  }
+}
+
+function fakerRecoveryFields(job, tabId) {
+  if (!job.faker || job.faker.tabId !== tabId) return {};
+  return {
+    sessionId: job.faker.sessionId,
+    clicks: Number.isInteger(job.faker.clicks) ? job.faker.clicks : 0,
+    reloads: Number.isInteger(job.faker.reloads) ? job.faker.reloads : 0,
+  };
+}
+
+async function startFakerForJob(reason) {
+  const engine = fakerEngine();
+  if (!engine || !fakerSettings().enabled) return null;
+  const job = await readJob();
+  const tabId = reason === 'reader' ? job.readerTabId : job.tabId;
+  if (!Number.isInteger(tabId)) return null;
+
+  let session = engine.sessionForTab(tabId);
+  if (!session) {
+    session = await engine.start({tabId, reason, ...fakerRecoveryFields(job, tabId)}).catch(() => null);
+  }
+  if (!session) return null;
+
+  const faker = {
+    sessionId: session.id, tabId, reason,
+    startedAt: session.startedAt, clicks: session.clicks || 0, reloads: session.reloads || 0,
+  };
+  if (job.faker?.sessionId === session.id) return updateJob(job, {message: fakerProgressMessage(session)});
+  return updateJob(job, {faker, message: fakerProgressMessage(session)});
+}
+
+async function autoStartFakerFromContent(tab, state) {
+  const engine = fakerEngine();
+  if (!engine || !fakerSettings().enabled || !state?.detected) return;
+  if (!tab || !Number.isInteger(tab.id) || engine.sessionForTab(tab.id)) return;
+  const source = parseUrl(tab.url);
+  if (!source || !(publisherHosts.has(source.hostname) || pdfHosts.has(source.hostname))) return;
+
+  const job = await readJob();
+  const isGate = job.status === 'working' && ['page', 'download'].includes(job.phase) && job.tabId === tab.id;
+  const isReader = job.status === 'attention' && job.phase === 'manual-download' &&
+    job.awaitingBrowserDownload === true && job.readerTabId === tab.id;
+  if (!isGate && !isReader) {
+    // No download job is waiting on this tab, but a ScienceDirect page is
+    // showing a verification challenge: solve it anyway so the user never has
+    // to tick the box manually while browsing or after a job finished.
+    await engine.start({tabId: tab.id, reason: 'standalone'}).catch(() => null);
+    return;
+  }
+
+  const reason = isGate ? 'gate' : 'reader';
+  const session = await engine.start({tabId: tab.id, reason, ...fakerRecoveryFields(job, tab.id)}).catch(() => null);
+  if (!session) return;
+
+  const latest = await readJob();
+  const stillGate = latest.status === 'working' && ['page', 'download'].includes(latest.phase) && latest.tabId === tab.id;
+  const stillReader = latest.status === 'attention' && latest.phase === 'manual-download' &&
+    latest.awaitingBrowserDownload === true && latest.readerTabId === tab.id;
+  if (!(reason === 'gate' ? stillGate : stillReader) || latest.faker?.sessionId === session.id) return;
+  await updateJob(latest, {
+    faker: {
+      sessionId: session.id, tabId: tab.id, reason,
+      startedAt: session.startedAt, clicks: session.clicks || 0, reloads: session.reloads || 0,
+    },
+    message: fakerProgressMessage(session),
+  });
+}
+
+async function continueAfterFakerCleared(job) {
+  const cleared = {...job, faker: null};
+  if (cleared.phase === 'download' && cleared.pii && cleared.title) {
+    const page = await readPage(cleared);
+    if (page.kind === 'challenge') {
+      const restarted = await startFakerForJob('gate');
+      if (restarted) return restarted;
+      return pauseAtGate(cleared, page);
+    }
+    await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
+    const next = await updateJob(cleared, {
+      status: 'working', message: 'Cloudflare 验证已通过，正在继续验证论文 PDF…',
+    });
+    run(next);
+    return next;
+  }
+
+  // Extreme speed (v2.5): do not wait for the page to finish loading after the
+  // challenge clears — processJob will keep waiting for the real article page.
+  const page = await readPage(cleared);
+  if (page.kind === 'closed') return pause(cleared, '论文标签页已关闭，正在尝试自动重新打开…');
+  if (page.kind === 'waiting') return resumeJob(cleared, false, true);
+  if (['challenge', 'access'].includes(page.kind)) {
+    if (page.kind === 'challenge') {
+      const restarted = await startFakerForJob('gate');
+      if (restarted) return restarted;
+    }
+    return pauseAtGate(cleared, page);
+  }
+  if (matchesVerifiedPage(cleared, page)) return resumeJob(cleared, false, true);
+  return pause(cleared, 'Cloudflare 验证已通过，但页面尚未回到目标论文页。请确认页面后点「继续下载」。');
+}
+
+function initFaker() {
+  const engine = fakerEngine();
+  if (!engine || typeof engine.init !== 'function') return;
+  engine.init({
+    async onSessionStart(session) {
+      const job = await readJob();
+      if (!job.faker || job.faker.sessionId !== session.id) return;
+      await updateJob(job, {message: fakerProgressMessage(session)});
+    },
+    async onSessionProgress(session) {
+      const job = await readJob();
+      if (!job.faker || job.faker.sessionId !== session.id) return;
+      const faker = {
+        ...job.faker,
+        clicks: session.clicks || 0,
+        reloads: session.reloads || 0,
+        phase: session.phase || job.faker.phase,
+      };
+      const active = (job.status === 'working' && ['page', 'download'].includes(job.phase)) ||
+        (job.status === 'attention' && job.phase === 'manual-download');
+      const changes = {faker};
+      if (active) {
+        const message = fakerProgressMessage(session);
+        if (message && message !== job.message) changes.message = message;
+      }
+      const countersChanged = job.faker.clicks !== faker.clicks ||
+        job.faker.reloads !== faker.reloads || job.faker.phase !== faker.phase;
+      if (!countersChanged && !changes.message) return;
+      await updateJob(job, changes);
+    },
+    async onCleared(session) {
+      const job = await readJob();
+      if (job.faker?.sessionId !== session.id) return;
+      // v2.7: ignore a stale tab whose verification finished after the job was
+      // moved to another tab — otherwise several tabs resume the same job and
+      // fetch the same PDF at the same time.
+      if (session.reason !== 'reader' && Number.isInteger(job.tabId) && job.tabId !== session.tabId) return;
+      const cleared = {...job, faker: null};
+      if (session.reason === 'reader') {
+        if (cleared.status === 'attention' && cleared.phase === 'manual-download') {
+          await updateJob(cleared, {
+            message: cleared.awaitingBrowserDownload ?
+              'Cloudflare 验证已通过，等待 Edge 下载…' : cleared.message,
+          });
+        } else {
+          await updateJob(cleared, {});
+        }
+        return;
+      }
+      await continueAfterFakerCleared(cleared);
+    },
+    async onFailed(session, reason) {
+      const job = await readJob();
+      if (job.faker?.sessionId !== session.id) return;
+      if (session.reason !== 'reader' && Number.isInteger(job.tabId) && job.tabId !== session.tabId) return;
+      const cleaned = {...job, faker: null};
+      if (session.reason === 'reader') {
+        if (cleaned.status !== 'attention' || cleaned.phase !== 'manual-download') {
+          await updateJob(cleaned, {});
+          return;
+        }
+        if (['no_target', 'timeout', 'tab_closed', 'disabled'].includes(reason)) {
+          await updateJob(cleaned, {});
+          return;
+        }
+        await updateJob(cleaned, {
+          message: reason === 'auto_click_off'
+            ? '已在设置中关闭自动点击验证框。请在打开的页面完成验证，完成后 Edge 会自动下载。'
+            : '自动通过 Cloudflare 验证未成功。请在打开的页面完成验证，完成后 Edge 会自动下载。',
+        });
+        return;
+      }
+      if (reason === 'tab_closed') return pause(cleaned, '论文标签页已关闭，正在尝试自动重新打开…');
+      const page = await readPage(cleaned);
+      if (['challenge', 'access'].includes(page.kind)) {
+        if (reason === 'auto_click_off') {
+          return pauseAtGate(cleaned, page,
+            '已在设置中关闭自动点击验证框。请在论文页面手动完成验证，然后点「继续下载」。');
+        }
+        if (['debugger_unavailable', 'debugger_error'].includes(reason)) {
+          return pause(cleaned,
+            '自动点击验证框需要「调试」权限，或验证标签页正被开发者工具占用。请在论文页面手动完成验证，然后点「继续下载」。');
+        }
+        return pauseAtGate(cleaned, page);
+      }
+      if (cleaned.phase === 'page' && matchesVerifiedPage(cleaned, page)) {
+        return resumeJob(cleaned, false, true);
+      }
+      if (cleaned.phase === 'download') {
+        return enqueueAction(() => awaitBrowserDownload(cleaned, page));
+      }
+      return pause(cleaned, '自动通过 Cloudflare 验证未成功。请在论文页面完成验证，然后点「继续下载」。');
+    },
+  }).catch((error) => console.warn('Cloudflare Faker did not start:', error?.message || error));
+}
+
 async function processJob(job) {
   if (job.phase === 'transfer') return inspectDownload(job);
   if (job.phase === 'desktop') return saveToDesktop(job);
@@ -893,7 +1375,10 @@ async function processJob(job) {
     page = await waitForPage(job);
   }
   if (page.kind === 'waiting') {
-    // Re-check tabs that are still loading without changing their URL.
+    // A Cloudflare interstitial can keep the tab in the loading state for a
+    // long time; page.js (document_idle) is not injected yet. Keep the job
+    // alive and let the Faker watcher handle a detected challenge, instead of
+    // declaring the page broken. The watchdog alarm re-checks periodically.
     const tab = await chrome.tabs.get(job.tabId).catch(() => null);
     const waits = (Number.isInteger(job.pageWaits) ? job.pageWaits : 0) + 1;
     if (tab && tab.status === 'loading' && waits <= 20) {
@@ -907,9 +1392,15 @@ async function processJob(job) {
       return pause(job, 'ScienceDirect 页面加载超时。请检查网络后刷新页面，或点「继续下载」重试。');
     }
   }
-  if (['challenge', 'access'].includes(page.kind)) return pauseAtGate(job, page);
+  if (['challenge', 'access'].includes(page.kind)) {
+    if (page.kind === 'challenge') {
+      const started = await startFakerForJob('gate');
+      if (started) return started;
+    }
+    return pauseAtGate(job, page);
+  }
   if (page.kind === 'unavailable') return showPdfFailure(job, 'page_unavailable');
-  if (page.kind === 'closed') return pause(job, '论文标签页已关闭。请打开原论文页后重新下载。');
+  if (page.kind === 'closed') return pause(job, '论文标签页已关闭，正在尝试自动重新打开…');
   if (job.resumedAfterVerification && !matchesVerifiedPage(job, page)) {
     return pause(job, '原论文或搜索页已切换。请回到原页面后点「继续下载」。');
   }
@@ -955,6 +1446,7 @@ function run(job) {
 
 async function start(job, message) {
   if (job.status === 'working') return job;
+  stopFakerQuietly();
   if (job.gateWatchId) void gateWatchMessage(job, 'sd:stop-watch-gate');
   if (job.watchDeadline) {
     await clearReaderDownloadRule();
@@ -962,6 +1454,8 @@ async function start(job, message) {
   }
   const fresh = {
     status: 'working', phase: 'page', message: loadingMessage,
+    autoRecoverCount: 0, autoDownloadRetryCount: 0,
+    autoRecoverNotice: false, autoRecoverExhausted: false, pausedFromPhase: null,
     claimId: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
   };
   // A new task must not inherit a stale duplicate-download claim from an old one.
@@ -1044,6 +1538,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     return false;
   }
+  if (message.type === 'sd:faker-state' || message.type === 'sd:faker-click' || message.type === 'sd:faker-stalled') {
+    if (!sender.tab || !Number.isInteger(sender.tab.id)) return false;
+    const source = parseUrl(sender.url || sender.tab.url);
+    if (!source || !(publisherHosts.has(source.hostname) || pdfHosts.has(source.hostname))) return false;
+    const engine = fakerEngine();
+    try {
+      if (engine) engine.handleMessage(message, sender);
+    } catch (error) {
+      console.warn('Cloudflare Faker message handling failed:', error?.message || error);
+    }
+    if (message.type === 'sd:faker-state' && message.state?.detected && engine && !engine.sessionForTab(sender.tab.id)) {
+      const tab = sender.tab;
+      void enqueueAction(() => autoStartFakerFromContent(tab, message.state));
+    }
+    return false;
+  }
   // The docked helper panel (content script on ScienceDirect pages) may use
   // the same status/action messages as the toolbar popup.
   const panelUrl = Number.isInteger(sender.tab?.id) && sender.frameId === 0 ? parseUrl(sender.url) : null;
@@ -1068,11 +1578,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changes) => {
+  if (fakerEngine()) void SDFakerBackground.onTabUpdated(tabId, changes);
+  if (changes.url) void enqueueAction(() => detectReaderViewerFailure(tabId, changes.url));
   if (changes.status === 'complete') void enqueueAction(() => checkVerifiedPage(tabId));
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  injectedTabs.delete(tabId);
+  if (fakerEngine()) void SDFakerBackground.onTabRemoved(tabId);
 });
 
 chrome.downloads.onCreated.addListener((item) => {
@@ -1092,6 +1604,18 @@ chrome.downloads.onChanged.addListener(({id, state}) => {
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === watchdog) void readJob().then(run);
   if (alarm.name === browserWatchdog) void enqueueAction(expireBrowserWatch);
+  if (alarm.name === autoRecoverAlarm) void enqueueAction(runAutoRecovery);
+  if (alarm.name.startsWith(fakerAlarmPrefix) && fakerEngine()) void SDFakerBackground.handleAlarm(alarm);
 });
 
+// The Faker settings UI was removed per user request; the feature stays on by
+// default and every install/update restores these defaults.
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details?.reason !== 'install' && details?.reason !== 'update') return;
+  void chrome.storage.local.set({
+    fakerSettings: {enabled: true, autoClick: true},
+  }).catch(() => {});
+});
+
+initFaker();
 void loadSavedDownloads();
