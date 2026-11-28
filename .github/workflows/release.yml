@@ -60,7 +60,7 @@ jobs:
             $packageFiles = @(
               'manifest.json', 'background.js', 'page.js', 'offscreen.html', 'offscreen.js',
               'popup.html', 'popup.css', 'popup.js', 'icons',
-              'faker-core.js', 'faker-content.js', 'faker-background.js', 'panel.js', 'NOTICE',
+              'panel.js',
               'register-desktop-host.ps1', 'register-desktop-host.cmd', 'README.md', 'CHANGELOG.md'
             )
             Copy-Item -LiteralPath $packageFiles -Destination $bundle -Recurse
@@ -96,7 +96,7 @@ jobs:
           $readme = Get-Content -LiteralPath README.md -Raw
           $downloadLine = "**当前版本：v$version** ｜ [⬇ 下载最新版本](https://github.com/$env:GITHUB_REPOSITORY/releases/latest) ｜ 历史更新记录见 [CHANGELOG.md](CHANGELOG.md)"
           $updated = $readme -replace '(?m)^# .*$', "# ScienceDirect 论文下载助手 v$version"
-          $updated = $updated -replace '(?m)^\*\*当前版本：.*$', $downloadLine
+          $updated = $updated -replace '(?m)^\*\*当前版本[:：]?.*$', $downloadLine
           if ($updated -ne $readme) {
             Set-Content -LiteralPath README.md -Value $updated -Encoding utf8 -NoNewline
             git config user.name 'github-actions[bot]'
