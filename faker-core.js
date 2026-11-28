@@ -13,13 +13,13 @@
   const LIMITS = Object.freeze({
     // v3.3: click few times with a slower cadence so a real click cannot hit
     // the Turnstile branding link and does not disturb the challenge.
-    maxClicks: 3,
+    maxClicks: 5,
     // Fewer page reloads: reloading too fast is a common cause of failed checks.
-    maxReloads: 3,
+    maxReloads: 8,
     // v3.3 timing: wait ~3.5s between clicks and leave Cloudflare several
     // seconds to process each click before deciding to click again/reload.
-    clickIntervalMs: 2000,
-    armDelayMs: 600,
+    clickIntervalMs: 1200,
+    armDelayMs: 400,
     sessionTimeoutMs: 240000,
     stateIntervalMs: 500,
   });

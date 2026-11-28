@@ -25,19 +25,31 @@ const stateKey = 'downloadJob';
 const watchdog = 'scienceDirectDownload';
 const browserWatchdog = 'scienceDirectBrowserDownload';
 const browserDownloadWindow = 15 * 60 * 1000;
-// When the extension is updated while a paper page stays open, that page keeps
-// the previous content script and cannot start the in-page download. Reload the
-// same page (it stays open) and retry, at most this many times.
-const pageDownloadReloadLimit = 2;
-const manualPageDownloadMessage = '请在论文页点「View PDF」，再点 Edge 阅读器右上角的下载按钮，扩展会校验并保存到桌面。';
-const pageDownloadRuleIds = [1, 2, 3];
-// Reliable fallback channel: open the publisher PDF in a short-lived background
-// tab (like v3 did) when the in-page request is blocked by the site. The tab is
-// closed automatically once the download is captured, and the paper page is
-// never touched.
-const fallbackDownloadRuleIds = [4, 5, 6];
-const inlineFallbackAlarm = 'scienceDirectInlineFallback';
-const inlineDownloadWindow = 6000;
+const readerDownloadRuleIds = [1, 2, 3];
+const turnstileBlockRuleId = 9;
+// Turnstile contains a Cloudflare branding link at its bottom-right corner.
+// Block that navigation at the browser level so an automatic click can never
+// open cloudflare.com/products/turnstile. The rule is re-added on every start.
+async function ensureTurnstileBlockRule() {
+  try {
+    const rules = await chrome.declarativeNetRequest.getSessionRules();
+    if (rules.some((rule) => rule.id === turnstileBlockRuleId)) return;
+    await chrome.declarativeNetRequest.updateSessionRules({
+      addRules: [{
+        id: turnstileBlockRuleId,
+        priority: 10,
+        action: {type: 'block'},
+        condition: {
+          urlFilter: '||cloudflare.com/products/turnstile',
+          initiatorDomains: ['sciencedirect.com', 'challenges.cloudflare.com'],
+          resourceTypes: ['main_frame'],
+        },
+      }],
+    });
+  } catch (error) {
+    console.warn('Could not install the Turnstile brand-link block rule:', error?.message || error);
+  }
+}
 const desktopHost = 'org.sciencedirect_desktop.save';
 const publisher = 'https://www.sciencedirect.com';
 const publisherHosts = new Set(['www.sciencedirect.com', 'sciencedirect.com']);
@@ -82,12 +94,10 @@ function pause(job, message, canRetry = true) {
 function fail(job, message) {
   if (job.blobUrl) void releasePdf(job.blobUrl);
   if (Number.isInteger(job.readerTabId)) void closeReaderTab(job, {force: true});
-  if (job.awaitingBrowserDownload) void stopPageDownload(job.tabId);
-  clearInlineFallback();
   stopFakerQuietly();
   return updateJob(job, {
     status: 'error', message, phase: null, blobUrl: null, faker: null,
-    readerTabId: null, awaitingBrowserDownload: false, pendingPdfUrl: null, pendingPdfFilename: null,
+    readerTabId: null, awaitingBrowserDownload: false,
   });
 }
 
@@ -194,34 +204,22 @@ async function readPage(job, tabId = job.tabId) {
     const existingPdf = officialPdf(tab.url, job.pii);
     if (tab.status === 'loading' && tab.pendingUrl && tab.pendingUrl !== tab.url) return {kind: 'waiting'};
     if (url && publisherHosts.has(url.hostname)) {
-      // Other content scripts (e.g. the Cloudflare Faker watcher) may also be
-      // listening, in which case sendMessage can resolve with `undefined` before
-      // page.js is injected. Once the tab has finished loading and a retry still
-      // gets no page snapshot, the old page script is gone (extension update)
-      // and the page has to be reloaded.
-      const inspect = async () => {
-        try {
-          return await chrome.tabs.sendMessage(tab.id, {type: 'sd:inspect'});
-        } catch {
-          return null;
+      try {
+        const page = await chrome.tabs.sendMessage(tab.id, {type: 'sd:inspect'});
+        // Other content scripts (e.g. the Cloudflare Faker watcher) may also be
+        // listening, in which case sendMessage can resolve with `undefined`
+        // before page.js is injected. Treat that as "still loading" instead of
+        // misreading the tab as a page without content.
+        if (page && typeof page === 'object' && typeof page.kind === 'string') {
+          return {...page, url};
         }
-      };
-      let page = await inspect();
-      if (page && typeof page === 'object' && typeof page.kind === 'string') return {...page, url};
-      if (tab.status !== 'complete') {
-        return {kind: 'waiting', url, loaded: false};
+        return {kind: 'waiting', url, loaded: tab.status === 'complete'};
+      } catch {
+        if (existingPdf && tab.status === 'complete') {
+          return {kind: 'viewer', url, pdfUrl: existingPdf, pii: job.pii, uninspected: true};
+        }
+        return {kind: 'waiting', url, loaded: tab.status === 'complete'};
       }
-      // document_idle can land just after the load event; give it two short
-      // chances before treating the page as carrying an outdated script.
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        await waitFor(600);
-        page = await inspect();
-        if (page && typeof page === 'object' && typeof page.kind === 'string') return {...page, url};
-      }
-      if (existingPdf) {
-        return {kind: 'viewer', url, pdfUrl: existingPdf, pii: job.pii, uninspected: true};
-      }
-      return {kind: 'stale', url};
     }
     if (existingPdf) return {kind: 'viewer', url, pdfUrl: existingPdf, pii: job.pii, uninspected: true};
     return {kind: 'waiting', outside: tab.status === 'complete'};
@@ -268,7 +266,7 @@ async function resumeJob(job, retryNavigation, resumedAfterVerification = false,
   await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
   const next = await updateJob(job, {
     status: 'working', phase: 'page', message: loadingMessage, downloadId: null, retryNavigation,
-    gateWatchId: null, pdfAttempt: 0, pdfFailure: null, pageWaits: 0, pageDownloadReloads: 0,
+    gateWatchId: null, pdfAttempt: 0, pdfFailure: null, pageWaits: 0,
     resumedAfterVerification, faker: null,
     pausedFromPhase: null, autoRecoverNotice: false, autoRecoverExhausted: false,
     autoRecoverCount: resetAutoRecover ? 0 : autoRecoverCount,
@@ -444,18 +442,16 @@ async function finishDesktopSave(job) {
   stopFakerQuietly();
   return updateJob(job, {
     status: 'complete', phase: null, stagedFile: null, readerTabId: null,
-    awaitingBrowserDownload: false, browserDownload: false, pendingPdfUrl: null, pendingPdfFilename: null,
+    awaitingBrowserDownload: false, browserDownload: false,
     message: job.title ? `已保存到桌面《${job.title}》` : '论文 PDF 已保存到桌面。',
   });
 }
 
-function clearPageDownloadRule() {
-  return chrome.declarativeNetRequest.updateSessionRules({
-    removeRuleIds: [...pageDownloadRuleIds, ...fallbackDownloadRuleIds],
-  }).catch(() => {});
+function clearReaderDownloadRule() {
+  return chrome.declarativeNetRequest.updateSessionRules({removeRuleIds: readerDownloadRuleIds}).catch(() => {});
 }
 
-function setDownloadRules(ids, resourceTypes, tabId, url, pii, filename) {
+function enableReaderDownload(tabId, url, pii, filename) {
   const encodedFilename = encodeURIComponent(filename).replace(/['()*]/g, (character) =>
     `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
   const destinations = [
@@ -464,32 +460,22 @@ function setDownloadRules(ids, resourceTypes, tabId, url, pii, filename) {
   ];
   if (publisherHosts.has(new URL(url).hostname)) destinations.push({urlFilter: `|${url}|`});
   return chrome.declarativeNetRequest.updateSessionRules({
-    removeRuleIds: ids,
+    removeRuleIds: readerDownloadRuleIds,
     addRules: destinations.map((destination, index) => ({
-      id: ids[index],
+      id: readerDownloadRuleIds[index],
       action: {
         type: 'modifyHeaders',
         responseHeaders: [{header: 'content-disposition', operation: 'set', value: `attachment; filename*=UTF-8''${encodedFilename}`}],
       },
       condition: {
         tabIds: [tabId],
-        resourceTypes,
+        resourceTypes: ['main_frame'],
         ...destination,
         responseHeaders: [{header: 'content-type', values: ['application/pdf', 'application/pdf;*']}],
         excludedResponseHeaders: [{header: 'content-range'}],
       },
     })),
   });
-}
-
-function enablePageDownload(tabId, url, pii, filename) {
-  // The PDF is requested by a hidden frame inside the paper tab, so the paper
-  // page itself never navigates away.
-  return setDownloadRules(pageDownloadRuleIds, ['sub_frame'], tabId, url, pii, filename);
-}
-
-function enableFallbackDownload(tabId, url, pii, filename) {
-  return setDownloadRules(fallbackDownloadRuleIds, ['main_frame'], tabId, url, pii, filename);
 }
 
 async function closeReaderTab(job, options = {}) {
@@ -502,62 +488,6 @@ async function closeReaderTab(job, options = {}) {
   if (!disposable) return;
   await chrome.tabs.remove(job.readerTabId).catch(() => {});
   if (Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
-}
-
-// Remove the hidden frame the paper page uses to request its PDF. The frame is
-// invisible and lives inside the paper tab, so the paper page itself is kept.
-function stopPageDownload(tabId) {
-  if (!Number.isInteger(tabId)) return Promise.resolve();
-  return chrome.tabs.sendMessage(tabId, {type: 'sd:stop-page-download'}, {frameId: 0}).catch(() => {});
-}
-
-// True when the paper page runs the current content script. Pages opened before
-// an extension update keep the old script, which does not understand the
-// in-page download message; those pages need one reload.
-async function pageDownloadSupported(tabId) {
-  if (!Number.isInteger(tabId)) return false;
-  const response = await chrome.tabs.sendMessage(tabId, {type: 'sd:page-download-ping'}, {frameId: 0}).catch(() => null);
-  return Boolean(response?.supported);
-}
-
-function clearInlineFallback() {
-  void chrome.alarms.clear(inlineFallbackAlarm).catch(() => {});
-}
-
-// On some ScienceDirect sessions Cloudflare refuses the hidden in-page PDF
-// request, so no Edge download ever starts. Fall back to the channel that v3
-// used successfully: open the publisher PDF in a short-lived background tab,
-// turn the response into an Edge download with the session rule, then let the
-// existing capture logic close that tab. The paper page is never touched.
-async function startFallbackDownload() {
-  const job = await readJob();
-  if (job.status !== 'attention' || job.phase !== 'manual-download' || !job.awaitingBrowserDownload ||
-      job.readerTabId || job.browserDownload || !job.pendingPdfUrl || !job.pendingPdfFilename ||
-      !Number.isInteger(job.tabId)) return;
-  await clearPageDownloadRule();
-  await stopPageDownload(job.tabId);
-  const reader = await chrome.tabs.create({url: 'about:blank', openerTabId: job.tabId, active: false}).catch(() => null);
-  if (!reader) return;
-  try {
-    await enableFallbackDownload(reader.id, job.pendingPdfUrl, job.pii, job.pendingPdfFilename);
-  } catch (error) {
-    console.warn('Could not configure the fallback PDF download:', error.message);
-    await clearPageDownloadRule();
-    await chrome.tabs.remove(reader.id).catch(() => {});
-    return;
-  }
-  const pending = await updateJob(job, {
-    readerTabId: reader.id, pendingPdfUrl: null, pendingPdfFilename: null,
-    message: '论文页内下载没有开始，已改用兼容下载方式，正在等待 Edge 下载并校验 PDF…',
-  });
-  try {
-    await chrome.tabs.update(reader.id, {url: job.pendingPdfUrl, active: false});
-  } catch {
-    await clearPageDownloadRule();
-    await chrome.tabs.remove(reader.id).catch(() => {});
-    return updateJob(pending, {readerTabId: null});
-  }
-  return pending;
 }
 
 async function awaitBrowserDownload(job, page) {
@@ -580,72 +510,32 @@ async function awaitBrowserDownload(job, page) {
   const url = officialPdf(page.pdfUrl, job.pii) || await resolvePdf(job);
   if (!url) return next;
 
-  // Download from the paper page itself: a hidden frame in the paper tab asks
-  // for the publisher PDF with the page's own session, and the session rule
-  // turns that response into a normal Edge download. This replaces the old
-  // blank tab, so the paper page is never replaced or closed.
-  let configured = false;
-  let hostUnavailable = false;
-  let filename = '';
+  // Register the download before navigating, so an inline PDF or immediate
+  // attachment can be saved from the publisher's normal document response.
+  const reader = await chrome.tabs.create({url: 'about:blank', openerTabId: job.tabId, active: false}).catch(() => null);
+  if (!reader) return next;
+  let automatic = true;
   try {
-    filename = await pdfFilename(job);
-    await enablePageDownload(job.tabId, url, job.pii, filename);
-    configured = true;
+    const filename = await pdfFilename(job);
+    await enableReaderDownload(reader.id, url, job.pii, filename);
   } catch (error) {
     console.warn('Could not configure automatic PDF attachment:', error.message);
-    // Only native-messaging failures mean the desktop helper is not registered;
-    // any other error keeps the generic manual fallback.
-    hostUnavailable = /native messaging host|native host|Failed to start native/i.test(error.message || '');
-  }
-  if (!configured) {
-    await clearPageDownloadRule();
-    if (hostUnavailable) {
-      return updateJob(next, {
-        canRetry: true,
-        message: '桌面保存组件未注册或不可用。请在本扩展目录运行一次 register-desktop-host.cmd，然后点「继续下载」。',
-      });
-    }
-    return updateJob(next, {message: manualPageDownloadMessage});
+    automatic = false;
   }
   const pending = await updateJob(next, {
-    message: '已从论文页请求 ScienceDirect 的官方 PDF 下载，正在等待 Edge 下载并校验 PDF。',
+    readerTabId: reader.id,
+    message: automatic
+      ? '已打开 ScienceDirect 的官方 PDF 链接，正在等待 Edge 下载并校验 PDF。'
+      : '已打开 ScienceDirect 的官方 PDF 链接。若进入 Edge 阅读器，请点右上角「保存」。',
   });
-  const trigger = () => chrome.tabs.sendMessage(job.tabId, {
-    type: 'sd:page-download', url, pii: job.pii,
-  }, {frameId: 0}).catch(() => null);
-  let started = await trigger();
-  if (started?.ok !== true) {
-    // A page that is still finishing its own render can reject the first try.
-    await waitFor(600);
-    started = await trigger();
+  try {
+    await chrome.tabs.update(reader.id, {url, active: true});
+    return pending;
+  } catch {
+    await clearReaderDownloadRule();
+    await chrome.tabs.remove(reader.id).catch(() => {});
+    return updateJob(next, {readerTabId: null});
   }
-  if (started?.ok === true) {
-    // The in-page request was accepted. Wait a few seconds for its download; if
-    // nothing starts, the alarm below switches to the reliable fallback channel.
-    const inline = await updateJob(pending, {pendingPdfUrl: url, pendingPdfFilename: filename});
-    await chrome.alarms.create(inlineFallbackAlarm, {when: Date.now() + inlineDownloadWindow});
-    return inline;
-  }
-
-  await clearPageDownloadRule();
-  const reloads = Number.isInteger(job.pageDownloadReloads) ? job.pageDownloadReloads : 0;
-  if (reloads < pageDownloadReloadLimit && !(await pageDownloadSupported(job.tabId))) {
-    // The paper tab still runs an older content script (the extension was
-    // updated while the page stayed open). Reload the same paper page so it
-    // keeps the page open but gets the current script, then continue the same
-    // download automatically.
-    await chrome.alarms.clear(browserWatchdog);
-    const reloading = await updateJob(next, {
-      status: 'working', phase: 'page', awaitingBrowserDownload: false, watchDeadline: null,
-      pageDownloadReloads: reloads + 1, manualReader: false, gateWatchId: null, downloadId: null,
-      message: '论文页上的扩展脚本版本较旧，正在自动刷新论文页后继续下载…',
-    });
-    await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
-    await chrome.tabs.reload(job.tabId, {bypassCache: true}).catch(() => {});
-    run(reloading);
-    return reloading;
-  }
-  return updateJob(next, {canRetry: true, message: manualPageDownloadMessage});
 }
 
 function matchesBrowserDownload(job, item) {
@@ -675,16 +565,14 @@ async function captureBrowserDownload(id) {
   const [item] = await chrome.downloads.search({id});
   if (!matchesBrowserDownload(job, item)) return;
 
-  await clearPageDownloadRule();
-  clearInlineFallback();
+  await clearReaderDownloadRule();
   await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
   await closeReaderTab(job, {force: true});
-  await stopPageDownload(job.tabId);
   stopFakerQuietly();
   const next = await updateJob(job, {
     status: 'working', phase: 'desktop', awaitingBrowserDownload: false, browserDownload: true,
     downloadId: id, stagedFile: item.filename, manualDownloadIds: [...job.manualDownloadIds, id],
-    readerTabId: null, pendingPdfUrl: null, pendingPdfFilename: null,
+    readerTabId: null,
     message: '正在校验 Edge 下载的 PDF 并保存到桌面…',
   });
   run(next);
@@ -693,13 +581,10 @@ async function captureBrowserDownload(id) {
 async function expireBrowserWatch() {
   const job = await readJob();
   if (job.status !== 'attention' || job.phase !== 'manual-download' || Date.now() < job.watchDeadline) return;
-  await clearPageDownloadRule();
-  clearInlineFallback();
+  await clearReaderDownloadRule();
   await closeReaderTab(job, {force: true});
-  await stopPageDownload(job.tabId);
   return updateJob(job, {
     phase: null, awaitingBrowserDownload: false, canRetry: false, readerTabId: null,
-    pendingPdfUrl: null, pendingPdfFilename: null,
     message: '等待 Edge 下载已超时。需要自动保存到桌面时，请重新提交这篇论文。',
   });
 }
@@ -708,10 +593,6 @@ function canonicalArticle(pii) {
   return `${publisher}/science/article/pii/${pii}`;
 }
 
-// The Turnstile widget contains a Cloudflare branding link at its bottom-right
-// corner. Automatic clicking must never open that marketing page; if a click
-// still lands on it (e.g. the widget moved between measurement and click), go
-// back to the paper page and continue the download automatically.
 function isTurnstileProductUrl(value) {
   try {
     const url = new URL(value);
@@ -727,11 +608,8 @@ async function recoverFromTurnstileLink(tabId) {
   if (!job) return;
   if (job.tabId !== tabId && job.readerTabId !== tabId) return;
   if (!['working', 'attention'].includes(job.status)) return;
-  // Stop the clicking session so it cannot navigate again.
   try { fakerEngine()?.stop(tabId); } catch { /* ignore */ }
   if (job.readerTabId === tabId) {
-    // The short-lived PDF tab was the one mis-clicked: close it and let the
-    // existing retry/watch logic continue from the paper page.
     await chrome.tabs.remove(tabId).catch(() => {});
     return updateJob({...job, faker: null, readerTabId: null}, {
       message: job.awaitingBrowserDownload
@@ -754,9 +632,11 @@ async function recoverFromTurnstileLink(tabId) {
 
 async function closeAccidentalTurnstileTab(tabId) {
   const job = await readJob();
-  if (!job || !job.faker || job.status !== 'working') return;
+  let clicking = false;
+  try { clicking = Boolean(fakerEngine()?.hasActiveSessions?.()); } catch { /* ignore */ }
+  if (!clicking && !job?.faker) return;
   await chrome.tabs.remove(tabId).catch(() => {});
-  if (Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
+  if (job && Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
 }
 
 async function withArticleTab(job, useArticle) {
@@ -1092,12 +972,9 @@ async function retryManualDownload(job) {
       });
     }
     if (Number.isInteger(job.readerTabId)) await chrome.tabs.remove(job.readerTabId).catch(() => {});
-    await clearPageDownloadRule();
-    clearInlineFallback();
-    await stopPageDownload(job.tabId);
+    await clearReaderDownloadRule();
     const next = await updateJob(job, {
       status: 'working', phase: 'page', readerTabId: null, awaitingBrowserDownload: false,
-      pendingPdfUrl: null, pendingPdfFilename: null,
       manualReader: false, autoDownloadRetryCount: attempts, autoRecoverNotice: false,
       message: `正在自动重试 PDF 下载（第 ${attempts}/${autoDownloadRetries} 次）…`,
     });
@@ -1333,23 +1210,6 @@ async function processJob(job) {
     if (job.status !== 'working') return;
     page = await waitForPage(job);
   }
-  if (page.kind === 'stale') {
-    // The paper page still has content scripts from before an extension update,
-    // so it cannot answer the current scripts. Reload the same page (it stays
-    // open) and continue the job automatically.
-    const reloads = Number.isInteger(job.pageDownloadReloads) ? job.pageDownloadReloads : 0;
-    if (reloads < pageDownloadReloadLimit) {
-      const reloading = await updateJob(job, {
-        status: 'working', phase: 'page', pageDownloadReloads: reloads + 1, pageWaits: 0,
-        message: '论文页上的扩展脚本已过期，正在自动刷新论文页后继续…',
-      });
-      await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
-      await chrome.tabs.reload(job.tabId, {bypassCache: true}).catch(() => {});
-      run(reloading);
-      return reloading;
-    }
-    return pause(job, '论文页需要刷新才能使用最新扩展脚本。请刷新该论文页后点「继续下载」。');
-  }
   if (page.kind === 'waiting') {
     // A Cloudflare interstitial can keep the tab in the loading state for a
     // long time; page.js (document_idle) is not injected yet. Keep the job
@@ -1424,14 +1284,12 @@ async function start(job, message) {
   stopFakerQuietly();
   if (job.gateWatchId) void gateWatchMessage(job, 'sd:stop-watch-gate');
   if (job.watchDeadline) {
-    await clearPageDownloadRule();
-    clearInlineFallback();
-    await stopPageDownload(job.tabId);
+    await clearReaderDownloadRule();
     await chrome.alarms.clear(browserWatchdog);
   }
   const fresh = {
     status: 'working', phase: 'page', message: loadingMessage,
-    autoRecoverCount: 0, autoDownloadRetryCount: 0, pageDownloadReloads: 0,
+    autoRecoverCount: 0, autoDownloadRetryCount: 0,
     autoRecoverNotice: false, autoRecoverExhausted: false, pausedFromPhase: null,
   };
   if (message.mode === 'current') {
@@ -1584,7 +1442,6 @@ chrome.downloads.onChanged.addListener(({id, state}) => {
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === watchdog) void readJob().then(run);
   if (alarm.name === browserWatchdog) void enqueueAction(expireBrowserWatch);
-  if (alarm.name === inlineFallbackAlarm) void enqueueAction(startFallbackDownload);
   if (alarm.name === autoRecoverAlarm) void enqueueAction(runAutoRecovery);
   if (alarm.name.startsWith(fakerAlarmPrefix) && fakerEngine()) void SDFakerBackground.handleAlarm(alarm);
 });
@@ -1593,9 +1450,15 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // default and restore these defaults on every install/update.
 chrome.runtime.onInstalled.addListener((details) => {
   if (details?.reason !== 'install' && details?.reason !== 'update') return;
+  void ensureTurnstileBlockRule();
   void chrome.storage.local.set({
     fakerSettings: {enabled: true, autoClick: true},
   }).catch(() => {});
 });
 
+chrome.runtime.onStartup.addListener(() => {
+  void ensureTurnstileBlockRule();
+});
+
+void ensureTurnstileBlockRule();
 initFaker();

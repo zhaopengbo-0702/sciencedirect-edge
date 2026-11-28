@@ -532,5 +532,6 @@
     handleAlarm,
     getSettings,
     isAttached: (tabId) => attachedTabs.has(tabId),
+    hasActiveSessions: () => sessions.size > 0,
   };
 })();
