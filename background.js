@@ -26,30 +26,6 @@ const watchdog = 'scienceDirectDownload';
 const browserWatchdog = 'scienceDirectBrowserDownload';
 const browserDownloadWindow = 15 * 60 * 1000;
 const readerDownloadRuleIds = [1, 2, 3];
-const turnstileBlockRuleId = 9;
-// Turnstile contains a Cloudflare branding link at its bottom-right corner.
-// Block that navigation at the browser level so an automatic click can never
-// open cloudflare.com/products/turnstile. The rule is re-added on every start.
-async function ensureTurnstileBlockRule() {
-  try {
-    const rules = await chrome.declarativeNetRequest.getSessionRules();
-    if (rules.some((rule) => rule.id === turnstileBlockRuleId)) return;
-    await chrome.declarativeNetRequest.updateSessionRules({
-      addRules: [{
-        id: turnstileBlockRuleId,
-        priority: 10,
-        action: {type: 'block'},
-        condition: {
-          urlFilter: '||cloudflare.com/products/turnstile',
-          initiatorDomains: ['sciencedirect.com', 'challenges.cloudflare.com'],
-          resourceTypes: ['main_frame'],
-        },
-      }],
-    });
-  } catch (error) {
-    console.warn('Could not install the Turnstile brand-link block rule:', error?.message || error);
-  }
-}
 const desktopHost = 'org.sciencedirect_desktop.save';
 const publisher = 'https://www.sciencedirect.com';
 const publisherHosts = new Set(['www.sciencedirect.com', 'sciencedirect.com']);
@@ -591,52 +567,6 @@ async function expireBrowserWatch() {
 
 function canonicalArticle(pii) {
   return `${publisher}/science/article/pii/${pii}`;
-}
-
-function isTurnstileProductUrl(value) {
-  try {
-    const url = new URL(value);
-    if (!/(^|\.)cloudflare\.com$/i.test(url.hostname)) return false;
-    return /^\/products\/turnstile(?:\/|$)/i.test(url.pathname);
-  } catch {
-    return false;
-  }
-}
-
-async function recoverFromTurnstileLink(tabId) {
-  const job = await readJob();
-  if (!job) return;
-  if (job.tabId !== tabId && job.readerTabId !== tabId) return;
-  if (!['working', 'attention'].includes(job.status)) return;
-  try { fakerEngine()?.stop(tabId); } catch { /* ignore */ }
-  if (job.readerTabId === tabId) {
-    await chrome.tabs.remove(tabId).catch(() => {});
-    return updateJob({...job, faker: null, readerTabId: null}, {
-      message: job.awaitingBrowserDownload
-        ? '误触 Cloudflare 品牌链接，正在等待 Edge 下载并校验 PDF…'
-        : job.message,
-    });
-  }
-  const target = job.targetUrl || (job.pii ? canonicalArticle(job.pii) : '');
-  if (!target) {
-    await pause(job, '误触了 Cloudflare 品牌链接。请回到论文页后点「继续下载」。');
-    return;
-  }
-  const next = await updateJob({...job, faker: null}, {
-    status: 'working', phase: 'page', canRetry: true,
-    message: '误触 Cloudflare 品牌链接，已自动返回论文页，继续下载…',
-  });
-  await chrome.tabs.update(tabId, {url: target, active: true}).catch(() => {});
-  run(next);
-}
-
-async function closeAccidentalTurnstileTab(tabId) {
-  const job = await readJob();
-  let clicking = false;
-  try { clicking = Boolean(fakerEngine()?.hasActiveSessions?.()); } catch { /* ignore */ }
-  if (!clicking && !job?.faker) return;
-  await chrome.tabs.remove(tabId).catch(() => {});
-  if (job && Number.isInteger(job.tabId)) await chrome.tabs.update(job.tabId, {active: true}).catch(() => {});
 }
 
 async function withArticleTab(job, useArticle) {
@@ -1409,16 +1339,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changes) => {
-  if (changes.url && isTurnstileProductUrl(changes.url)) void enqueueAction(() => recoverFromTurnstileLink(tabId));
   if (fakerEngine()) void SDFakerBackground.onTabUpdated(tabId, changes);
   if (changes.url) void enqueueAction(() => detectReaderViewerFailure(tabId, changes.url));
   if (changes.status === 'complete') void enqueueAction(() => checkVerifiedPage(tabId));
-});
-
-chrome.tabs.onCreated.addListener((tab) => {
-  if (isTurnstileProductUrl(tab.pendingUrl || tab.url || '')) {
-    void enqueueAction(() => closeAccidentalTurnstileTab(tab.id));
-  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -1450,15 +1373,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // default and restore these defaults on every install/update.
 chrome.runtime.onInstalled.addListener((details) => {
   if (details?.reason !== 'install' && details?.reason !== 'update') return;
-  void ensureTurnstileBlockRule();
   void chrome.storage.local.set({
     fakerSettings: {enabled: true, autoClick: true},
   }).catch(() => {});
 });
 
-chrome.runtime.onStartup.addListener(() => {
-  void ensureTurnstileBlockRule();
-});
-
-void ensureTurnstileBlockRule();
 initFaker();

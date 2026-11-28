@@ -343,42 +343,6 @@
     }
   }
 
-  // Download inside the paper page: a hidden frame requests the official PDF
-  // with the page's own session, and the background session rule turns that
-  // response into an Edge download. The paper page itself never navigates and
-  // no extra blank/PDF tab is opened.
-  let downloadFrame;
-  let downloadFrameTimer;
-
-  function stopPageDownload() {
-    clearTimeout(downloadFrameTimer);
-    downloadFrameTimer = undefined;
-    downloadFrame?.remove();
-    downloadFrame = undefined;
-  }
-
-  function startPageDownload({ url, pii }) {
-    const page = inspectPage();
-    if (page.kind !== 'article' || (pii && page.pii !== pii.toUpperCase())) {
-      return { ok: false, reason: 'ineligible' };
-    }
-    const pdfUrl = matchingPdfUrl(url, page.pii);
-    if (!pdfUrl) return { ok: false, reason: 'ineligible' };
-
-    stopPageDownload();
-    const frame = document.createElement('iframe');
-    frame.id = 'sd-edge-page-download';
-    frame.setAttribute('aria-hidden', 'true');
-    frame.tabIndex = -1;
-    frame.style.cssText =
-      'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;border:0;opacity:0;pointer-events:none;';
-    frame.src = pdfUrl;
-    (document.body || document.documentElement).appendChild(frame);
-    downloadFrame = frame;
-    downloadFrameTimer = setTimeout(stopPageDownload, 120000);
-    return { ok: true };
-  }
-
   function stopWatchingGate(watchId) {
     if (!gateWatch || gateWatch.id !== watchId) return;
     gateWatch.observer.disconnect();
@@ -436,13 +400,6 @@
     } else if (message?.type === 'sd:fetch-page-pdf') {
       void fetchPagePdf(message).then(sendResponse);
       return true;
-    } else if (message?.type === 'sd:page-download-ping') {
-      sendResponse({supported: true});
-    } else if (message?.type === 'sd:page-download') {
-      sendResponse(startPageDownload(message));
-    } else if (message?.type === 'sd:stop-page-download') {
-      stopPageDownload();
-      sendResponse({ stopped: true });
     } else if (message?.type === 'sd:watch-gate') {
       sendResponse({ watching: watchGate(message) });
     } else if (message?.type === 'sd:stop-watch-gate') {

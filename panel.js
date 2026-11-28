@@ -16,7 +16,6 @@
 
   const HOST_ID = 'sd-edge-helper-host';
   const HIDDEN_KEY = 'sdHelperHidden';
-  const PENDING_ACTION_KEY = 'sdPanelPendingAction';
   const REFRESH_MS = 2000;
 
   const host = document.createElement('div');
@@ -227,33 +226,13 @@
       }
       const response = await chrome.runtime.sendMessage(message);
       if (response?.state) state = response.state;
-    } catch (error) {
-      if (/context invalidated/i.test(String(error?.message || error))) {
-        // The extension was updated while this page stayed open, so the old
-        // content script can no longer reach it. Remember the user's action,
-        // reload the page (the paper page itself is kept) and replay the action
-        // once the new scripts are running.
-        try { sessionStorage.setItem(PENDING_ACTION_KEY, JSON.stringify(message)); } catch {}
-        location.reload();
-        return;
-      }
+    } catch {
       state = {status: 'error', message: '操作未完成，请刷新页面后重试。'};
     } finally {
       pending = false;
       render();
       void refresh();
     }
-  }
-
-  function resumePendingAction() {
-    let raw = null;
-    try { raw = sessionStorage.getItem(PENDING_ACTION_KEY); } catch { return; }
-    if (!raw) return;
-    try { sessionStorage.removeItem(PENDING_ACTION_KEY); } catch {}
-    let message = null;
-    try { message = JSON.parse(raw); } catch { return; }
-    if (!message || typeof message !== 'object' || typeof message.type !== 'string') return;
-    setTimeout(() => void act(message), 500);
   }
 
   el.close.addEventListener('click', () => {
@@ -300,7 +279,6 @@
 
   void loadHidden();
   void refresh();
-  resumePendingAction();
   refreshTimer = setInterval(() => {
     if (document.visibilityState === 'visible' && !hidden) void refresh();
   }, REFRESH_MS);

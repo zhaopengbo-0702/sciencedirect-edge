@@ -23,10 +23,7 @@
     const mutationThrottleMs = 250;
     const fallbackPollMs = 800;
     const scrollSettleMs = 120;
-    const widgetWatchdogMs = 20000;
-    // v3.3: after the last click, wait long enough for Cloudflare to finish its
-    // check before the session may report a stall (which triggers a reload).
-    const clickSettleMs = 5000;
+    const widgetWatchdogMs = 12000;
     const frameSelector = 'iframe[src*="challenges.cloudflare.com"], iframe[src*="challenge-platform"]';
 
     let armed = false;
@@ -257,7 +254,7 @@
       send({type: 'sd:faker-click', sessionId, points, attempt});
       if (clicksSent >= limits.maxClicks) {
         clearTimer('budget');
-        budgetTimer = setTimeout(guard(finishClickBudget), clickSettleMs);
+        budgetTimer = setTimeout(guard(finishClickBudget), limits.clickIntervalMs);
       } else {
         scheduleClick(limits.clickIntervalMs);
       }
