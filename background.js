@@ -31,6 +31,13 @@ const browserDownloadWindow = 15 * 60 * 1000;
 const pageDownloadReloadLimit = 2;
 const manualPageDownloadMessage = '请在论文页点「View PDF」，再点 Edge 阅读器右上角的下载按钮，扩展会校验并保存到桌面。';
 const pageDownloadRuleIds = [1, 2, 3];
+// Reliable fallback channel: open the publisher PDF in a short-lived background
+// tab (like v3 did) when the in-page request is blocked by the site. The tab is
+// closed automatically once the download is captured, and the paper page is
+// never touched.
+const fallbackDownloadRuleIds = [4, 5, 6];
+const inlineFallbackAlarm = 'scienceDirectInlineFallback';
+const inlineDownloadWindow = 6000;
 const desktopHost = 'org.sciencedirect_desktop.save';
 const publisher = 'https://www.sciencedirect.com';
 const publisherHosts = new Set(['www.sciencedirect.com', 'sciencedirect.com']);
@@ -76,10 +83,11 @@ function fail(job, message) {
   if (job.blobUrl) void releasePdf(job.blobUrl);
   if (Number.isInteger(job.readerTabId)) void closeReaderTab(job, {force: true});
   if (job.awaitingBrowserDownload) void stopPageDownload(job.tabId);
+  clearInlineFallback();
   stopFakerQuietly();
   return updateJob(job, {
     status: 'error', message, phase: null, blobUrl: null, faker: null,
-    readerTabId: null, awaitingBrowserDownload: false,
+    readerTabId: null, awaitingBrowserDownload: false, pendingPdfUrl: null, pendingPdfFilename: null,
   });
 }
 
@@ -436,16 +444,18 @@ async function finishDesktopSave(job) {
   stopFakerQuietly();
   return updateJob(job, {
     status: 'complete', phase: null, stagedFile: null, readerTabId: null,
-    awaitingBrowserDownload: false, browserDownload: false,
+    awaitingBrowserDownload: false, browserDownload: false, pendingPdfUrl: null, pendingPdfFilename: null,
     message: job.title ? `已保存到桌面《${job.title}》` : '论文 PDF 已保存到桌面。',
   });
 }
 
 function clearPageDownloadRule() {
-  return chrome.declarativeNetRequest.updateSessionRules({removeRuleIds: pageDownloadRuleIds}).catch(() => {});
+  return chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [...pageDownloadRuleIds, ...fallbackDownloadRuleIds],
+  }).catch(() => {});
 }
 
-function enablePageDownload(tabId, url, pii, filename) {
+function setDownloadRules(ids, resourceTypes, tabId, url, pii, filename) {
   const encodedFilename = encodeURIComponent(filename).replace(/['()*]/g, (character) =>
     `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
   const destinations = [
@@ -454,24 +464,32 @@ function enablePageDownload(tabId, url, pii, filename) {
   ];
   if (publisherHosts.has(new URL(url).hostname)) destinations.push({urlFilter: `|${url}|`});
   return chrome.declarativeNetRequest.updateSessionRules({
-    removeRuleIds: pageDownloadRuleIds,
+    removeRuleIds: ids,
     addRules: destinations.map((destination, index) => ({
-      id: pageDownloadRuleIds[index],
+      id: ids[index],
       action: {
         type: 'modifyHeaders',
         responseHeaders: [{header: 'content-disposition', operation: 'set', value: `attachment; filename*=UTF-8''${encodedFilename}`}],
       },
       condition: {
-        // The PDF is requested by a hidden frame inside the paper tab, so the
-        // paper page itself never navigates away.
         tabIds: [tabId],
-        resourceTypes: ['sub_frame'],
+        resourceTypes,
         ...destination,
         responseHeaders: [{header: 'content-type', values: ['application/pdf', 'application/pdf;*']}],
         excludedResponseHeaders: [{header: 'content-range'}],
       },
     })),
   });
+}
+
+function enablePageDownload(tabId, url, pii, filename) {
+  // The PDF is requested by a hidden frame inside the paper tab, so the paper
+  // page itself never navigates away.
+  return setDownloadRules(pageDownloadRuleIds, ['sub_frame'], tabId, url, pii, filename);
+}
+
+function enableFallbackDownload(tabId, url, pii, filename) {
+  return setDownloadRules(fallbackDownloadRuleIds, ['main_frame'], tabId, url, pii, filename);
 }
 
 async function closeReaderTab(job, options = {}) {
@@ -502,6 +520,46 @@ async function pageDownloadSupported(tabId) {
   return Boolean(response?.supported);
 }
 
+function clearInlineFallback() {
+  void chrome.alarms.clear(inlineFallbackAlarm).catch(() => {});
+}
+
+// On some ScienceDirect sessions Cloudflare refuses the hidden in-page PDF
+// request, so no Edge download ever starts. Fall back to the channel that v3
+// used successfully: open the publisher PDF in a short-lived background tab,
+// turn the response into an Edge download with the session rule, then let the
+// existing capture logic close that tab. The paper page is never touched.
+async function startFallbackDownload() {
+  const job = await readJob();
+  if (job.status !== 'attention' || job.phase !== 'manual-download' || !job.awaitingBrowserDownload ||
+      job.readerTabId || job.browserDownload || !job.pendingPdfUrl || !job.pendingPdfFilename ||
+      !Number.isInteger(job.tabId)) return;
+  await clearPageDownloadRule();
+  await stopPageDownload(job.tabId);
+  const reader = await chrome.tabs.create({url: 'about:blank', openerTabId: job.tabId, active: false}).catch(() => null);
+  if (!reader) return;
+  try {
+    await enableFallbackDownload(reader.id, job.pendingPdfUrl, job.pii, job.pendingPdfFilename);
+  } catch (error) {
+    console.warn('Could not configure the fallback PDF download:', error.message);
+    await clearPageDownloadRule();
+    await chrome.tabs.remove(reader.id).catch(() => {});
+    return;
+  }
+  const pending = await updateJob(job, {
+    readerTabId: reader.id, pendingPdfUrl: null, pendingPdfFilename: null,
+    message: '论文页内下载没有开始，已改用兼容下载方式，正在等待 Edge 下载并校验 PDF…',
+  });
+  try {
+    await chrome.tabs.update(reader.id, {url: job.pendingPdfUrl, active: false});
+  } catch {
+    await clearPageDownloadRule();
+    await chrome.tabs.remove(reader.id).catch(() => {});
+    return updateJob(pending, {readerTabId: null});
+  }
+  return pending;
+}
+
 async function awaitBrowserDownload(job, page) {
   const watchStartedAt = Date.now();
   if (page.kind === 'viewer' && page.pii === job.pii) {
@@ -528,8 +586,9 @@ async function awaitBrowserDownload(job, page) {
   // blank tab, so the paper page is never replaced or closed.
   let configured = false;
   let hostUnavailable = false;
+  let filename = '';
   try {
-    const filename = await pdfFilename(job);
+    filename = await pdfFilename(job);
     await enablePageDownload(job.tabId, url, job.pii, filename);
     configured = true;
   } catch (error) {
@@ -560,7 +619,13 @@ async function awaitBrowserDownload(job, page) {
     await waitFor(600);
     started = await trigger();
   }
-  if (started?.ok === true) return pending;
+  if (started?.ok === true) {
+    // The in-page request was accepted. Wait a few seconds for its download; if
+    // nothing starts, the alarm below switches to the reliable fallback channel.
+    const inline = await updateJob(pending, {pendingPdfUrl: url, pendingPdfFilename: filename});
+    await chrome.alarms.create(inlineFallbackAlarm, {when: Date.now() + inlineDownloadWindow});
+    return inline;
+  }
 
   await clearPageDownloadRule();
   const reloads = Number.isInteger(job.pageDownloadReloads) ? job.pageDownloadReloads : 0;
@@ -611,6 +676,7 @@ async function captureBrowserDownload(id) {
   if (!matchesBrowserDownload(job, item)) return;
 
   await clearPageDownloadRule();
+  clearInlineFallback();
   await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
   await closeReaderTab(job, {force: true});
   await stopPageDownload(job.tabId);
@@ -618,7 +684,7 @@ async function captureBrowserDownload(id) {
   const next = await updateJob(job, {
     status: 'working', phase: 'desktop', awaitingBrowserDownload: false, browserDownload: true,
     downloadId: id, stagedFile: item.filename, manualDownloadIds: [...job.manualDownloadIds, id],
-    readerTabId: null,
+    readerTabId: null, pendingPdfUrl: null, pendingPdfFilename: null,
     message: '正在校验 Edge 下载的 PDF 并保存到桌面…',
   });
   run(next);
@@ -628,10 +694,12 @@ async function expireBrowserWatch() {
   const job = await readJob();
   if (job.status !== 'attention' || job.phase !== 'manual-download' || Date.now() < job.watchDeadline) return;
   await clearPageDownloadRule();
+  clearInlineFallback();
   await closeReaderTab(job, {force: true});
   await stopPageDownload(job.tabId);
   return updateJob(job, {
     phase: null, awaitingBrowserDownload: false, canRetry: false, readerTabId: null,
+    pendingPdfUrl: null, pendingPdfFilename: null,
     message: '等待 Edge 下载已超时。需要自动保存到桌面时，请重新提交这篇论文。',
   });
 }
@@ -974,9 +1042,11 @@ async function retryManualDownload(job) {
     }
     if (Number.isInteger(job.readerTabId)) await chrome.tabs.remove(job.readerTabId).catch(() => {});
     await clearPageDownloadRule();
+    clearInlineFallback();
     await stopPageDownload(job.tabId);
     const next = await updateJob(job, {
       status: 'working', phase: 'page', readerTabId: null, awaitingBrowserDownload: false,
+      pendingPdfUrl: null, pendingPdfFilename: null,
       manualReader: false, autoDownloadRetryCount: attempts, autoRecoverNotice: false,
       message: `正在自动重试 PDF 下载（第 ${attempts}/${autoDownloadRetries} 次）…`,
     });
@@ -1304,6 +1374,7 @@ async function start(job, message) {
   if (job.gateWatchId) void gateWatchMessage(job, 'sd:stop-watch-gate');
   if (job.watchDeadline) {
     await clearPageDownloadRule();
+    clearInlineFallback();
     await stopPageDownload(job.tabId);
     await chrome.alarms.clear(browserWatchdog);
   }
@@ -1455,6 +1526,7 @@ chrome.downloads.onChanged.addListener(({id, state}) => {
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === watchdog) void readJob().then(run);
   if (alarm.name === browserWatchdog) void enqueueAction(expireBrowserWatch);
+  if (alarm.name === inlineFallbackAlarm) void enqueueAction(startFallbackDownload);
   if (alarm.name === autoRecoverAlarm) void enqueueAction(runAutoRecovery);
   if (alarm.name.startsWith(fakerAlarmPrefix) && fakerEngine()) void SDFakerBackground.handleAlarm(alarm);
 });
