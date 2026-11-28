@@ -1,6 +1,6 @@
-# ScienceDirect 论文下载助手 v3.3
+# ScienceDirect 论文下载助手 v3.3.1
 
-**当前版本：v3.3** ｜ [⬇ 下载最新版本](https://github.com/zhaopengbo-0702/sciencedirect-edge/releases/latest) ｜ 历史更新记录见 [CHANGELOG.md](CHANGELOG.md)
+**当前版本：v3.3.1** ｜ [⬇ 下载最新版本](https://github.com/zhaopengbo-0702/sciencedirect-edge/releases/latest) ｜ 历史更新记录见 [CHANGELOG.md](CHANGELOG.md)
 
 这是适用于 Microsoft Edge 的本地扩展。它一次处理一篇论文的正文 PDF。
 

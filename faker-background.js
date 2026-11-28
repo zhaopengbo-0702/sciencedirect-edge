@@ -333,8 +333,8 @@
     // refreshing the page. Refreshing immediately was the main cause of
     // "the page reloads before the click result comes back".
     const sinceClick = Number.isFinite(session.lastClickAt) ? Date.now() - session.lastClickAt : Infinity;
-    if (sinceClick < 6000) await wait(6000 - sinceClick);
-    await wait(1500);
+    if (sinceClick < 4000) await wait(4000 - sinceClick);
+    await wait(1000);
     session.reloads += 1;
     session.phase = 'reloading';
     session.challengeSeen = session.challengeSeen || stalledReason === 'no_widget';

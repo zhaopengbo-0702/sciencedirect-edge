@@ -18,8 +18,8 @@
     maxReloads: 3,
     // v3.3 timing: wait ~3.5s between clicks and leave Cloudflare several
     // seconds to process each click before deciding to click again/reload.
-    clickIntervalMs: 3500,
-    armDelayMs: 800,
+    clickIntervalMs: 2000,
+    armDelayMs: 600,
     sessionTimeoutMs: 240000,
     stateIntervalMs: 500,
   });
