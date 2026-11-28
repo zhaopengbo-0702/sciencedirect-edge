@@ -186,22 +186,34 @@ async function readPage(job, tabId = job.tabId) {
     const existingPdf = officialPdf(tab.url, job.pii);
     if (tab.status === 'loading' && tab.pendingUrl && tab.pendingUrl !== tab.url) return {kind: 'waiting'};
     if (url && publisherHosts.has(url.hostname)) {
-      try {
-        const page = await chrome.tabs.sendMessage(tab.id, {type: 'sd:inspect'});
-        // Other content scripts (e.g. the Cloudflare Faker watcher) may also be
-        // listening, in which case sendMessage can resolve with `undefined`
-        // before page.js is injected. Treat that as "still loading" instead of
-        // misreading the tab as a page without content.
-        if (page && typeof page === 'object' && typeof page.kind === 'string') {
-          return {...page, url};
+      // Other content scripts (e.g. the Cloudflare Faker watcher) may also be
+      // listening, in which case sendMessage can resolve with `undefined` before
+      // page.js is injected. Once the tab has finished loading and a retry still
+      // gets no page snapshot, the old page script is gone (extension update)
+      // and the page has to be reloaded.
+      const inspect = async () => {
+        try {
+          return await chrome.tabs.sendMessage(tab.id, {type: 'sd:inspect'});
+        } catch {
+          return null;
         }
-        return {kind: 'waiting', url, loaded: tab.status === 'complete'};
-      } catch {
-        if (existingPdf && tab.status === 'complete') {
-          return {kind: 'viewer', url, pdfUrl: existingPdf, pii: job.pii, uninspected: true};
-        }
-        return {kind: 'waiting', url, loaded: tab.status === 'complete'};
+      };
+      let page = await inspect();
+      if (page && typeof page === 'object' && typeof page.kind === 'string') return {...page, url};
+      if (tab.status !== 'complete') {
+        return {kind: 'waiting', url, loaded: false};
       }
+      // document_idle can land just after the load event; give it two short
+      // chances before treating the page as carrying an outdated script.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        await waitFor(600);
+        page = await inspect();
+        if (page && typeof page === 'object' && typeof page.kind === 'string') return {...page, url};
+      }
+      if (existingPdf) {
+        return {kind: 'viewer', url, pdfUrl: existingPdf, pii: job.pii, uninspected: true};
+      }
+      return {kind: 'stale', url};
     }
     if (existingPdf) return {kind: 'viewer', url, pdfUrl: existingPdf, pii: job.pii, uninspected: true};
     return {kind: 'waiting', outside: tab.status === 'complete'};
@@ -1199,6 +1211,23 @@ async function processJob(job) {
     job = await navigate({...job, retryNavigation: false}, job.targetUrl);
     if (job.status !== 'working') return;
     page = await waitForPage(job);
+  }
+  if (page.kind === 'stale') {
+    // The paper page still has content scripts from before an extension update,
+    // so it cannot answer the current scripts. Reload the same page (it stays
+    // open) and continue the job automatically.
+    const reloads = Number.isInteger(job.pageDownloadReloads) ? job.pageDownloadReloads : 0;
+    if (reloads < pageDownloadReloadLimit) {
+      const reloading = await updateJob(job, {
+        status: 'working', phase: 'page', pageDownloadReloads: reloads + 1, pageWaits: 0,
+        message: '论文页上的扩展脚本已过期，正在自动刷新论文页后继续…',
+      });
+      await chrome.alarms.create(watchdog, {periodInMinutes: 0.5});
+      await chrome.tabs.reload(job.tabId, {bypassCache: true}).catch(() => {});
+      run(reloading);
+      return reloading;
+    }
+    return pause(job, '论文页需要刷新才能使用最新扩展脚本。请刷新该论文页后点「继续下载」。');
   }
   if (page.kind === 'waiting') {
     // A Cloudflare interstitial can keep the tab in the loading state for a
